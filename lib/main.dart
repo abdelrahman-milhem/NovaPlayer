@@ -1,17 +1,17 @@
 import 'dart:ui';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'screens/videos_screen.dart';
 import 'screens/music_screen.dart';
 import 'screens/images_screen.dart';
 import 'screens/settings_screen.dart';
+import 'screens/vault_screen.dart';
 import 'package:media_kit/media_kit.dart';
 import 'global_player.dart';
 import 'widgets/mini_player.dart';
 import 'widgets/vault_progress_widget.dart';
-import 'screens/vault_screen.dart';
-import 'screens/playlists_screen.dart';
 import 'utils/app_settings.dart';
 import 'utils/app_localizations.dart';
 import 'utils/vault_helper.dart';
@@ -52,12 +52,17 @@ class _MediaPlayerAppState extends State<MediaPlayerApp> {
   }
 
   Future<void> _initializeServices() async {
-    // Run GlobalPlayer and AppSettings initialization in parallel to maximize launch performance
-    await Future.wait([
-      GlobalPlayer.init(),
-      AppSettings.init(),
-      VaultHelper.migrateOldVaultIfNeeded(),
-    ]);
+    await Future.wait([GlobalPlayer.init(), AppSettings.init()]);
+
+    if (Platform.isAndroid) {
+      final status = await Permission.manageExternalStorage.status;
+      if (!status.isGranted) {
+        await Permission.manageExternalStorage.request();
+      }
+    }
+
+    // Non-blocking background vault migration
+    VaultHelper.migrateOldVaultIfNeeded();
   }
 
   @override
@@ -66,7 +71,6 @@ class _MediaPlayerAppState extends State<MediaPlayerApp> {
       future: _initFuture,
       builder: (context, snapshot) {
         if (snapshot.connectionState != ConnectionState.done) {
-          // Sleek, high-performance splash screen rendered instantly in < 0.1 seconds
           return MaterialApp(
             home: Scaffold(
               backgroundColor: const Color(0xFF121212),
@@ -106,52 +110,43 @@ class _MediaPlayerAppState extends State<MediaPlayerApp> {
                     brightness: Brightness.light,
                     primaryColor: primaryColor,
                     scaffoldBackgroundColor: const Color(0xFFF8F9FB),
-                    appBarTheme: const AppBarTheme(
+                    iconTheme: IconThemeData(color: primaryColor),
+                    primaryIconTheme: IconThemeData(color: primaryColor),
+                    appBarTheme: AppBarTheme(
                       backgroundColor: Colors.transparent,
                       elevation: 0,
-                      surfaceTintColor: Colors.transparent,
+                      iconTheme: IconThemeData(color: primaryColor),
                     ),
-                    textTheme: GoogleFonts.cairoTextTheme(ThemeData.light().textTheme),
-                    useMaterial3: true,
                     colorScheme: ColorScheme.fromSeed(
                       seedColor: primaryColor,
                       brightness: Brightness.light,
+                    ),
+                    useMaterial3: true,
+                    textTheme: GoogleFonts.cairoTextTheme(
+                      ThemeData.light().textTheme,
                     ),
                   ),
                   darkTheme: ThemeData(
                     brightness: Brightness.dark,
                     primaryColor: primaryColor,
-                    scaffoldBackgroundColor: const Color(0xFF0B0E14),
-                    appBarTheme: const AppBarTheme(
+                    scaffoldBackgroundColor: const Color(0xFF0D0E15),
+                    iconTheme: IconThemeData(color: primaryColor),
+                    primaryIconTheme: IconThemeData(color: primaryColor),
+                    appBarTheme: AppBarTheme(
                       backgroundColor: Colors.transparent,
                       elevation: 0,
-                      surfaceTintColor: Colors.transparent,
+                      iconTheme: IconThemeData(color: primaryColor),
                     ),
-                    textTheme: GoogleFonts.cairoTextTheme(ThemeData.dark().textTheme),
-                    useMaterial3: true,
                     colorScheme: ColorScheme.fromSeed(
                       seedColor: primaryColor,
                       brightness: Brightness.dark,
                     ),
+                    useMaterial3: true,
+                    textTheme: GoogleFonts.cairoTextTheme(
+                      ThemeData.dark().textTheme,
+                    ),
                   ),
-                  builder: (context, child) {
-                    return ValueListenableBuilder<String>(
-                      valueListenable: AppSettings.languageNotifier,
-                      builder: (context, lang, childWidget) {
-                        return Directionality(
-                          textDirection: TextDirection.ltr,
-                          child: Stack(
-                            children: [
-                              childWidget!,
-                              const VaultProgressWidget(),
-                            ],
-                          ),
-                        );
-                      },
-                      child: child,
-                    );
-                  },
-                  home: const MainNavigationScreen(),
+                  home: const MainTabNavigationScreen(),
                   debugShowCheckedModeBanner: false,
                 );
               },
@@ -163,131 +158,265 @@ class _MediaPlayerAppState extends State<MediaPlayerApp> {
   }
 }
 
-class MainNavigationScreen extends StatefulWidget {
-  const MainNavigationScreen({super.key});
+class MainTabNavigationScreen extends StatefulWidget {
+  const MainTabNavigationScreen({super.key});
 
   @override
-  State<MainNavigationScreen> createState() => _MainNavigationScreenState();
+  State<MainTabNavigationScreen> createState() =>
+      _MainTabNavigationScreenState();
 }
 
-class _MainNavigationScreenState extends State<MainNavigationScreen> {
+class _MainTabNavigationScreenState extends State<MainTabNavigationScreen> {
   int _currentIndex = 0;
-
-  List<Widget> get _screens => [
-    VideosScreen(),
-    MusicScreen(),
-    ImagesScreen(),
-    SettingsScreen(),
-  ];
-
-  @override
-  void initState() {
-    super.initState();
-    _requestPermissions();
-  }
-
-  Future<void> _requestPermissions() async {
-    await [
-      Permission.storage,
-      Permission.manageExternalStorage,
-      Permission.photos,
-      Permission.videos,
-      Permission.audio,
-    ].request();
-  }
 
   @override
   Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    final primaryColor = Theme.of(context).primaryColor;
+    final Map<String, Widget> _screens = {
+      'music': const MusicScreen(),
+      'images': const ImagesScreen(),
+      'settings': const SettingsScreen(),
+      'videos': const VideosScreen(),
+    };
 
-    return ValueListenableBuilder<String>(
-      valueListenable: AppSettings.languageNotifier,
-      builder: (context, lang, child) {
+    final Map<String, IconData> _icons = {
+      'music': Icons.library_music_rounded,
+      'images': Icons.photo_library_rounded,
+      'settings': Icons.settings_rounded,
+      'videos': Icons.video_library_rounded,
+    };
+
+    return ValueListenableBuilder<List<String>>(
+      valueListenable: AppSettings.navigationOrderNotifier,
+      builder: (context, navOrder, child) {
+        final currentKey = navOrder.length > _currentIndex ? navOrder[_currentIndex] : 'videos';
+
         return Scaffold(
-          appBar: AppBar(
-            title: Text(
-              [
-                AppLocalizations.get('videos', lang),
-                AppLocalizations.get('music', lang),
-                AppLocalizations.get('images', lang),
-                AppLocalizations.get('settings', lang),
-              ][_currentIndex],
-              style: GoogleFonts.cairo(fontWeight: FontWeight.bold, fontSize: 20)
-            ),
-            centerTitle: true,
-            backgroundColor: Colors.transparent,
-            elevation: 0,
-            actions: [
-              IconButton(
-                icon: Icon(Icons.featured_play_list_rounded, color: primaryColor),
-                tooltip: AppLocalizations.get('playlists', lang),
-                onPressed: () {
-                  Navigator.push(context, MaterialPageRoute(builder: (_) => const PlaylistsScreen()));
-                },
-              ),
-              IconButton(
-                icon: Icon(Icons.lock_outline_rounded, color: primaryColor),
-                tooltip: 'الخزنة السرية',
-                onPressed: () {
-                  Navigator.push(context, MaterialPageRoute(builder: (_) => const VaultScreen()));
-                },
-              ),
-              const SizedBox(width: 8),
-            ],
+          body: _screens[currentKey] ?? const VideosScreen(),
+          bottomNavigationBar: BottomNavigationBar(
+            currentIndex: _currentIndex,
+            onTap: (index) => setState(() => _currentIndex = index),
+            items: navOrder.map((key) {
+              return BottomNavigationBarItem(
+                icon: Icon(_icons[key] ?? Icons.video_library_rounded),
+                label: key[0].toUpperCase() + key.substring(1),
+              );
+            }).toList(),
           ),
-          body: Column(
-            children: [
-              Expanded(child: _screens[_currentIndex]),
-              const MiniPlayer(),
-            ],
-          ),
-          bottomNavigationBar: Container(
-            decoration: BoxDecoration(
-              color: isDark ? const Color(0xFF121620) : Colors.white,
-              border: Border(
-                top: BorderSide(
-                  color: isDark ? const Color(0xFF1E2433) : const Color(0xFFE5E8F0),
-                  width: 1.0,
+        );
+      },
+    );
+  }
+}
+        }
+
+        String getLabel(String key, String lang) {
+          return AppLocalizations.get(key, lang);
+        }
+
+        final String lang = AppSettings.languageNotifier.value;
+        final isDark = Theme.of(context).brightness == Brightness.dark;
+        final primaryColor = Theme.of(context).primaryColor;
+
+        if (_currentIndex >= navOrder.length) {
+          _currentIndex = 0;
+        }
+
+        final Map<String, String> pageTitles = {
+          'videos': AppLocalizations.get('videos', lang),
+          'music': AppLocalizations.get('music', lang),
+          'images': AppLocalizations.get('images', lang),
+          'settings': AppLocalizations.get('settings', lang),
+        };
+
+        final currentKey = navOrder[_currentIndex];
+
+        return Scaffold(
+          backgroundColor: isDark
+              ? const Color(0xFF0D0E15)
+              : const Color(0xFFF5F7FB),
+          body: SafeArea(
+            child: Stack(
+              children: [
+                Column(
+                  children: [
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.fromLTRB(18, 16, 18, 14),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [
+                            primaryColor.withAlpha(isDark ? 210 : 170),
+                            primaryColor.withAlpha(isDark ? 120 : 100),
+                          ],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        borderRadius: const BorderRadius.only(
+                          bottomLeft: Radius.circular(24),
+                          bottomRight: Radius.circular(24),
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: primaryColor.withAlpha(isDark ? 35 : 20),
+                            blurRadius: 18,
+                            offset: const Offset(0, 10),
+                          ),
+                        ],
+                      ),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'NovaPlayer',
+                                  style: GoogleFonts.cairo(
+                                    fontSize: 14,
+                                    color: Colors.white70,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  pageTitles[currentKey] ?? 'Media',
+                                  style: GoogleFonts.cairo(
+                                    fontSize: 28,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          ValueListenableBuilder<bool>(
+                            valueListenable:
+                                AppSettings.showVaultOnMainScreenNotifier,
+                            builder: (context, showVault, child) {
+                              if (!showVault) {
+                                return const SizedBox.shrink();
+                              }
+
+                              return Container(
+                                padding: const EdgeInsets.all(2),
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withAlpha(18),
+                                  shape: BoxShape.circle,
+                                  border: Border.all(
+                                    color: Colors.white.withAlpha(35),
+                                    width: 1,
+                                  ),
+                                ),
+                                child: IconButton(
+                                  onPressed: () {
+                                    Navigator.push(
+                                      context,
+                                      MaterialPageRoute(
+                                        builder: (_) => const VaultScreen(),
+                                      ),
+                                    );
+                                  },
+                                  icon: const Icon(Icons.security_rounded),
+                                  color: Colors.white,
+                                  tooltip: AppLocalizations.get(
+                                    'vault_title',
+                                    lang,
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        child: IndexedStack(
+                          index: _currentIndex,
+                          children: navOrder
+                              .map((key) => getScreen(key))
+                              .toList(),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-              ),
-            ),
-            child: BottomNavigationBar(
-              currentIndex: _currentIndex,
-              type: BottomNavigationBarType.fixed,
-              elevation: 0,
-              backgroundColor: Colors.transparent,
-              selectedItemColor: primaryColor,
-              unselectedItemColor: isDark ? Colors.white38 : Colors.black38,
-              selectedLabelStyle: GoogleFonts.cairo(fontWeight: FontWeight.bold, fontSize: 12),
-              unselectedLabelStyle: GoogleFonts.cairo(fontSize: 11),
-              onTap: (index) {
-                setState(() {
-                  _currentIndex = index;
-                });
-              },
-              items: [
-                BottomNavigationBarItem(
-                  icon: const Icon(Icons.video_library_outlined),
-                  activeIcon: const Icon(Icons.video_library_rounded),
-                  label: AppLocalizations.get('videos', lang),
+                const Align(
+                  alignment: Alignment.bottomCenter,
+                  child: MiniPlayer(),
                 ),
-                BottomNavigationBarItem(
-                  icon: const Icon(Icons.library_music_outlined),
-                  activeIcon: const Icon(Icons.library_music_rounded),
-                  label: AppLocalizations.get('music', lang),
-                ),
-                BottomNavigationBarItem(
-                  icon: const Icon(Icons.photo_library_outlined),
-                  activeIcon: const Icon(Icons.photo_library_rounded),
-                  label: AppLocalizations.get('images', lang),
-                ),
-                BottomNavigationBarItem(
-                  icon: const Icon(Icons.settings_outlined),
-                  activeIcon: const Icon(Icons.settings_rounded),
-                  label: AppLocalizations.get('settings', lang),
-                ),
+                const VaultProgressWidget(),
               ],
+            ),
+          ),
+          bottomNavigationBar: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+            child: Container(
+              decoration: BoxDecoration(
+                color: isDark ? const Color(0xFF121924) : Colors.white,
+                borderRadius: BorderRadius.circular(26),
+                border: Border.all(
+                  color: isDark
+                      ? const Color(0xFF243042)
+                      : const Color(0xFFE7EBF3),
+                  width: 1,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withAlpha(isDark ? 38 : 18),
+                    blurRadius: 18,
+                    offset: const Offset(0, -4),
+                  ),
+                ],
+              ),
+              child: BottomNavigationBar(
+                currentIndex: _currentIndex,
+                onTap: (index) {
+                  setState(() {
+                    _currentIndex = index;
+                  });
+                },
+                type: BottomNavigationBarType.fixed,
+                backgroundColor: Colors.transparent,
+                elevation: 0,
+                selectedItemColor: Colors.white,
+                unselectedItemColor: isDark ? Colors.white60 : Colors.black54,
+                selectedLabelStyle: GoogleFonts.cairo(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 11,
+                ),
+                unselectedLabelStyle: GoogleFonts.cairo(fontSize: 10),
+                showSelectedLabels: true,
+                showUnselectedLabels: true,
+                iconSize: 24,
+                landscapeLayout: BottomNavigationBarLandscapeLayout.centered,
+                items: navOrder.map((key) {
+                  final isSelected = key == navOrder[_currentIndex];
+                  return BottomNavigationBarItem(
+                    icon: AnimatedContainer(
+                      duration: const Duration(milliseconds: 220),
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: isSelected ? primaryColor : Colors.transparent,
+                        borderRadius: BorderRadius.circular(16),
+                        boxShadow: isSelected
+                            ? [
+                                BoxShadow(
+                                  color: primaryColor.withAlpha(40),
+                                  blurRadius: 12,
+                                  offset: const Offset(0, 4),
+                                ),
+                              ]
+                            : null,
+                      ),
+                      child: getIcon(key),
+                    ),
+                    label: getLabel(key, lang),
+                  );
+                }).toList(),
+              ),
             ),
           ),
         );

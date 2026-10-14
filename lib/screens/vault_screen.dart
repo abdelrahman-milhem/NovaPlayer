@@ -2,8 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'dart:io';
-import 'dart:convert';
-import 'package:media_scanner/media_scanner.dart';
 import 'package:file_picker/file_picker.dart';
 import '../player_screen.dart';
 import '../utils/auth_helper.dart';
@@ -11,7 +9,10 @@ import '../utils/vault_helper.dart';
 import '../utils/app_settings.dart';
 import '../utils/app_localizations.dart';
 import 'image_viewer_screen.dart';
+import 'intruder_logs_screen.dart';
 import '../services/vault_service.dart';
+import '../widgets/vault_apps_tab.dart';
+import '../widgets/customization_dialogs.dart';
 
 class VaultScreen extends StatefulWidget {
   const VaultScreen({super.key});
@@ -42,23 +43,35 @@ class _VaultScreenState extends State<VaultScreen>
   bool _vaultSortAscending = false;
 
   late TabController _tabController;
+  final GlobalKey<VaultAppsTabState> _appsTabKey =
+      GlobalKey<VaultAppsTabState>();
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
+    _tabController = TabController(length: 5, vsync: this);
     _tabController.addListener(() {
-      if (_tabController.indexIsChanging) {
-        setState(() {
+      setState(() {
+        if (_tabController.indexIsChanging) {
           _selectedPaths.clear();
-        });
-      }
+        }
+      });
     });
+    VaultService.instance.mediaUpdateNotifier.addListener(_onVaultMediaChanged);
     _authenticate();
+  }
+
+  void _onVaultMediaChanged() {
+    if (mounted && _isAuthenticated) {
+      _loadHiddenFiles();
+    }
   }
 
   @override
   void dispose() {
+    VaultService.instance.mediaUpdateNotifier.removeListener(
+      _onVaultMediaChanged,
+    );
     _tabController.dispose();
     super.dispose();
   }
@@ -113,6 +126,18 @@ class _VaultScreenState extends State<VaultScreen>
 
   Future<void> _loadHiddenFiles() async {
     setState(() => _isLoading = true);
+    if (VaultService.isDecoyMode) {
+      if (mounted) {
+        setState(() {
+          _videoFiles = [];
+          _audioFiles = [];
+          _imageFiles = [];
+          _folderViewItems = [];
+          _isLoading = false;
+        });
+      }
+      return;
+    }
     try {
       Directory vaultDir = await VaultHelper.getVaultDirectory();
 
@@ -168,7 +193,9 @@ class _VaultScreenState extends State<VaultScreen>
     if (bytes <= 0) return "0 B";
     if (bytes < 1024) return "$bytes B";
     if (bytes < 1024 * 1024) return "${(bytes / 1024).toStringAsFixed(1)} KB";
-    if (bytes < 1024 * 1024 * 1024) return "${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB";
+    if (bytes < 1024 * 1024 * 1024) {
+      return "${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB";
+    }
     return "${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB";
   }
 
@@ -181,14 +208,22 @@ class _VaultScreenState extends State<VaultScreen>
     int compareFiles(File a, File b) {
       int res = 0;
       if (_vaultSortMode == 'name') {
-        String nameA = a.uri.pathSegments.last.replaceAll('.vault_hidden', '').toLowerCase();
-        String nameB = b.uri.pathSegments.last.replaceAll('.vault_hidden', '').toLowerCase();
+        String nameA = a.uri.pathSegments.last
+            .replaceAll('.vault_hidden', '')
+            .toLowerCase();
+        String nameB = b.uri.pathSegments.last
+            .replaceAll('.vault_hidden', '')
+            .toLowerCase();
         res = nameA.compareTo(nameB);
       } else if (_vaultSortMode == 'size') {
         int sizeA = 0;
         int sizeB = 0;
-        try { sizeA = a.lengthSync(); } catch (_) {}
-        try { sizeB = b.lengthSync(); } catch (_) {}
+        try {
+          sizeA = a.lengthSync();
+        } catch (_) {}
+        try {
+          sizeB = b.lengthSync();
+        } catch (_) {}
         res = sizeA.compareTo(sizeB);
       } else if (_vaultSortMode == 'type') {
         String extA = a.path.split('.').last.toLowerCase();
@@ -197,8 +232,12 @@ class _VaultScreenState extends State<VaultScreen>
       } else {
         DateTime dateA = DateTime.fromMillisecondsSinceEpoch(0);
         DateTime dateB = DateTime.fromMillisecondsSinceEpoch(0);
-        try { dateA = a.lastModifiedSync(); } catch (_) {}
-        try { dateB = b.lastModifiedSync(); } catch (_) {}
+        try {
+          dateA = a.lastModifiedSync();
+        } catch (_) {}
+        try {
+          dateB = b.lastModifiedSync();
+        } catch (_) {}
         res = dateA.compareTo(dateB);
       }
       return _vaultSortAscending ? res : -res;
@@ -213,8 +252,16 @@ class _VaultScreenState extends State<VaultScreen>
       if (a is File && b is Directory) return 1;
 
       if (a is Directory && b is Directory) {
-        String nameA = a.path.replaceAll('\\', '/').split('/').last.toLowerCase();
-        String nameB = b.path.replaceAll('\\', '/').split('/').last.toLowerCase();
+        String nameA = a.path
+            .replaceAll('\\', '/')
+            .split('/')
+            .last
+            .toLowerCase();
+        String nameB = b.path
+            .replaceAll('\\', '/')
+            .split('/')
+            .last
+            .toLowerCase();
         int res = nameA.compareTo(nameB);
         return _vaultSortAscending ? res : -res;
       } else if (a is File && b is File) {
@@ -249,15 +296,37 @@ class _VaultScreenState extends State<VaultScreen>
                     ),
                   ),
                   const SizedBox(height: 10),
-                  SwitchListTile(
-                    title: Text(
-                      AppLocalizations.get('asc_order', lang),
-                      style: GoogleFonts.cairo(fontSize: 13),
+                  ListTile(
+                    leading: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).primaryColor.withValues(alpha: 0.15),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        _vaultSortAscending
+                            ? Icons.arrow_upward_rounded
+                            : Icons.arrow_downward_rounded,
+                        color: Theme.of(context).primaryColor,
+                        size: 20,
+                      ),
                     ),
-                    value: _vaultSortAscending,
-                    activeThumbColor: Theme.of(context).primaryColor,
-                    onChanged: (val) {
-                      setSheetState(() => _vaultSortAscending = val);
+                    title: Text(
+                      _vaultSortAscending
+                          ? (lang == 'ar' ? 'ترتيب تصاعدي' : 'Ascending Order')
+                          : (lang == 'ar' ? 'ترتيب تنازلي' : 'Descending Order'),
+                      style: GoogleFonts.cairo(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                    trailing: Icon(
+                      Icons.swap_vert_rounded,
+                      color: Theme.of(context).primaryColor,
+                    ),
+                    onTap: () {
+                      setSheetState(() => _vaultSortAscending = !_vaultSortAscending);
                       setState(() {
                         _applyVaultSort();
                       });
@@ -266,9 +335,15 @@ class _VaultScreenState extends State<VaultScreen>
                   const Divider(),
                   ListTile(
                     leading: const Icon(Icons.access_time),
-                    title: Text(AppLocalizations.get('by_date', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('by_date', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _vaultSortMode == 'date'
-                        ? Icon(Icons.check, color: Theme.of(context).primaryColor)
+                        ? Icon(
+                            Icons.check,
+                            color: Theme.of(context).primaryColor,
+                          )
                         : null,
                     onTap: () {
                       _vaultSortMode = 'date';
@@ -278,9 +353,15 @@ class _VaultScreenState extends State<VaultScreen>
                   ),
                   ListTile(
                     leading: const Icon(Icons.sort_by_alpha),
-                    title: Text(AppLocalizations.get('by_name', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('by_name', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _vaultSortMode == 'name'
-                        ? Icon(Icons.check, color: Theme.of(context).primaryColor)
+                        ? Icon(
+                            Icons.check,
+                            color: Theme.of(context).primaryColor,
+                          )
                         : null,
                     onTap: () {
                       _vaultSortMode = 'name';
@@ -290,9 +371,15 @@ class _VaultScreenState extends State<VaultScreen>
                   ),
                   ListTile(
                     leading: const Icon(Icons.data_usage),
-                    title: Text(AppLocalizations.get('by_size', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('by_size', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _vaultSortMode == 'size'
-                        ? Icon(Icons.check, color: Theme.of(context).primaryColor)
+                        ? Icon(
+                            Icons.check,
+                            color: Theme.of(context).primaryColor,
+                          )
                         : null,
                     onTap: () {
                       _vaultSortMode = 'size';
@@ -302,9 +389,15 @@ class _VaultScreenState extends State<VaultScreen>
                   ),
                   ListTile(
                     leading: const Icon(Icons.category),
-                    title: Text(AppLocalizations.get('by_type', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('by_type', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _vaultSortMode == 'type'
-                        ? Icon(Icons.check, color: Theme.of(context).primaryColor)
+                        ? Icon(
+                            Icons.check,
+                            color: Theme.of(context).primaryColor,
+                          )
                         : null,
                     onTap: () {
                       _vaultSortMode = 'type';
@@ -324,7 +417,9 @@ class _VaultScreenState extends State<VaultScreen>
   void _restoreFile(File file) async {
     try {
       final String lang = AppSettings.languageNotifier.value;
-      final String title = lang == 'ar' ? 'استعادة ملف من الخزنة' : 'Restoring file from Vault';
+      final String title = lang == 'ar'
+          ? 'استعادة ملف من الخزنة'
+          : 'Restoring file from Vault';
 
       final int count = await VaultService.instance.restoreFiles(
         hiddenFiles: [file],
@@ -334,12 +429,16 @@ class _VaultScreenState extends State<VaultScreen>
       _loadHiddenFiles();
       if (mounted && count > 0) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(AppLocalizations.get('restore_success_single', lang))),
+          SnackBar(
+            content: Text(AppLocalizations.get('restore_success_single', lang)),
+          ),
         );
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('خطأ: $e')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('خطأ: $e')));
       }
     }
   }
@@ -363,7 +462,9 @@ class _VaultScreenState extends State<VaultScreen>
       List<File> filesToRestore = pathsToProcess.map((p) => File(p)).toList();
 
       final String lang = AppSettings.languageNotifier.value;
-      final String title = lang == 'ar' ? 'استعادة الملفات المحددة' : 'Restoring selected files';
+      final String title = lang == 'ar'
+          ? 'استعادة الملفات المحددة'
+          : 'Restoring selected files';
 
       final int count = await VaultService.instance.restoreFiles(
         hiddenFiles: filesToRestore,
@@ -373,7 +474,7 @@ class _VaultScreenState extends State<VaultScreen>
       for (String path in _selectedPaths) {
         if (Directory(path).existsSync()) {
           try {
-            Directory(path).deleteSync(recursive: false);
+            Directory(path).deleteSync(recursive: true);
           } catch (e) {}
         }
       }
@@ -385,7 +486,11 @@ class _VaultScreenState extends State<VaultScreen>
 
       if (mounted && count > 0) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(AppLocalizations.get('restore_success_multiple', lang))),
+          SnackBar(
+            content: Text(
+              AppLocalizations.get('restore_success_multiple', lang),
+            ),
+          ),
         );
       }
     } catch (e) {
@@ -411,7 +516,9 @@ class _VaultScreenState extends State<VaultScreen>
             .toList();
 
         final String lang = AppSettings.languageNotifier.value;
-        final String title = lang == 'ar' ? 'إضافة صور للخزنة' : 'Adding images to Vault';
+        final String title = lang == 'ar'
+            ? 'إضافة صور للخزنة'
+            : 'Adding images to Vault';
 
         final int count = await VaultService.instance.hideFiles(
           files: files,
@@ -421,7 +528,9 @@ class _VaultScreenState extends State<VaultScreen>
         _loadHiddenFiles();
         if (mounted && count > 0) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(AppLocalizations.get('upload_success', lang))),
+            SnackBar(
+              content: Text(AppLocalizations.get('upload_success', lang)),
+            ),
           );
         }
       }
@@ -444,13 +553,13 @@ class _VaultScreenState extends State<VaultScreen>
     });
   }
 
-  List<File> _getCurrentTabFiles() {
-    if (_tabController.index == 0) return _videoFiles;
-    if (_tabController.index == 1) return _audioFiles;
-    if (_tabController.index == 2) return _imageFiles;
+  List<String> _getCurrentTabPaths() {
+    if (_tabController.index == 0) return _videoFiles.map((f) => f.path).toList();
+    if (_tabController.index == 1) return _audioFiles.map((f) => f.path).toList();
+    if (_tabController.index == 2) return _imageFiles.map((f) => f.path).toList();
     return _folderViewItems
-        .whereType<File>()
-        .where((f) => f.path.endsWith('.vault_hidden'))
+        .where((entity) => !entity.path.endsWith('metadata.json'))
+        .map((entity) => entity.path)
         .toList();
   }
 
@@ -465,14 +574,20 @@ class _VaultScreenState extends State<VaultScreen>
     }).toList();
 
     if (filtered.isEmpty) {
+      if (showFolderSubtitle) return const SizedBox.shrink();
       return Center(
         child: Text(
           AppLocalizations.get('no_files', lang),
-          style: GoogleFonts.cairo(fontSize: 16, color: isDark ? Colors.white38 : Colors.black38),
+          style: GoogleFonts.cairo(
+            fontSize: 16,
+            color: isDark ? Colors.white38 : Colors.black38,
+          ),
         ),
       );
     }
     return ListView.builder(
+      shrinkWrap: showFolderSubtitle,
+      physics: showFolderSubtitle ? const NeverScrollableScrollPhysics() : null,
       padding: const EdgeInsets.symmetric(vertical: 4),
       itemCount: filtered.length,
       itemBuilder: (context, index) {
@@ -502,48 +617,58 @@ class _VaultScreenState extends State<VaultScreen>
           modDate = item.lastModifiedSync();
         } catch (_) {}
 
-        String folderName = item.parent.path.replaceAll('\\', '/').split('/').last;
-        String details = "${_formatFileSize(bytes)}${modDate != null ? ' • ${_formatDate(modDate)}' : ''}";
-        String subtitleStr = showFolderSubtitle ? "$folderName • $details" : details;
+        String folderName = item.parent.path
+            .replaceAll('\\', '/')
+            .split('/')
+            .last;
+        String details =
+            "${_formatFileSize(bytes)}${modDate != null ? ' • ${_formatDate(modDate)}' : ''}";
+        String subtitleStr = showFolderSubtitle
+            ? "$folderName • $details"
+            : details;
 
         final isSelected = _selectedPaths.contains(item.path);
 
         return Container(
           margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-          decoration: BoxDecoration(
-            color: isSelected
-                ? primaryColor.withValues(alpha: 0.12)
-                : isDark ? const Color(0xFF141824) : Colors.white,
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(
-              color: isSelected
-                  ? primaryColor
-                  : isDark ? const Color(0xFF1F2636) : const Color(0xFFE8ECEF),
-              width: isSelected ? 1.5 : 1.0,
-            ),
-          ),
           child: ListTile(
-            contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            tileColor: isSelected
+                ? primaryColor.withValues(alpha: 0.12)
+                : isDark
+                ? const Color(0xFF141824)
+                : Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+              side: BorderSide(
+                color: isSelected
+                    ? primaryColor
+                    : isDark
+                    ? const Color(0xFF1F2636)
+                    : const Color(0xFFE8ECEF),
+                width: isSelected ? 1.5 : 1.0,
+              ),
+            ),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 14,
+              vertical: 2,
+            ),
             leading: _isSelectionMode
                 ? Checkbox(
                     value: isSelected,
                     onChanged: (_) => _toggleSelection(item.path),
-                    activeColor: primaryColor,
                   )
                 : Container(
-                    width: 44,
-                    height: 44,
+                    padding: const EdgeInsets.all(8),
                     decoration: BoxDecoration(
-                      color: iconColor.withValues(alpha: 0.15),
+                      color: iconColor.withValues(alpha: 0.1),
                       borderRadius: BorderRadius.circular(12),
                     ),
-                    child: Icon(icon, size: 24, color: iconColor),
+                    child: Icon(icon, color: iconColor),
                   ),
             title: Text(
               fileName,
               style: GoogleFonts.cairo(
-                fontSize: 14,
+                fontSize: 15,
                 fontWeight: FontWeight.bold,
                 color: isDark ? Colors.white : Colors.black87,
               ),
@@ -553,17 +678,10 @@ class _VaultScreenState extends State<VaultScreen>
             subtitle: Text(
               subtitleStr,
               style: GoogleFonts.cairo(
-                fontSize: 11,
+                fontSize: 12,
                 color: isDark ? Colors.white54 : Colors.black54,
               ),
             ),
-            trailing: _isSelectionMode
-                ? null
-                : IconButton(
-                    icon: const Icon(Icons.restore_rounded, color: Colors.greenAccent),
-                    tooltip: AppLocalizations.get('restore_tooltip', lang),
-                    onPressed: () => _restoreFile(item),
-                  ),
             onLongPress: () => _toggleSelection(item.path),
             onTap: () {
               if (_isSelectionMode) {
@@ -571,22 +689,24 @@ class _VaultScreenState extends State<VaultScreen>
                 return;
               }
               if (_isImage(fileName)) {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => ImageViewerScreen(imageFile: item),
-                  ),
-                );
-              } else {
-                List<dynamic> mediaFiles = files.where((f) => !_isImage(f.uri.pathSegments.last)).toList();
-                int idx = mediaFiles.indexWhere((f) => f.path == item.path);
+                int idx = _imageFiles.indexWhere((f) => f.path == item.path);
                 if (idx == -1) idx = 0;
                 Navigator.push(
                   context,
                   MaterialPageRoute(
-                    builder: (_) => PlayerScreen(
-                      mediaFiles: mediaFiles,
+                    builder: (_) => ImageViewerScreen(
+                      imagesList: _imageFiles.isNotEmpty ? _imageFiles : [item],
                       initialIndex: idx,
+                    ),
+                  ),
+                );
+              } else {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => PlayerScreen(
+                      mediaFiles: [item],
+                      initialIndex: 0,
                       isVideo: _isVideo(fileName),
                     ),
                   ),
@@ -600,12 +720,6 @@ class _VaultScreenState extends State<VaultScreen>
   }
 
   Widget _buildFolderView() {
-    String lang = AppSettings.languageNotifier.value;
-    if (_folderViewItems.isEmpty) {
-      return Center(
-        child: Text(AppLocalizations.get('empty_folder', lang), style: GoogleFonts.cairo(fontSize: 18)),
-      );
-    }
     return ListView.builder(
       itemCount: _folderViewItems.length,
       itemBuilder: (context, index) {
@@ -624,105 +738,66 @@ class _VaultScreenState extends State<VaultScreen>
                   '/',
                 )[item.path.replaceAll('\\', '/').split('/').length - 2];
           }
-          return ListTile(
-            leading: _isSelectionMode
-                ? Checkbox(
-                    value: _selectedPaths.contains(item.path),
-                    onChanged: (_) => _toggleSelection(item.path),
-                    activeColor: Theme.of(context).primaryColor,
-                  )
-                : const Icon(
-                    Icons.folder,
-                    color: Colors.orangeAccent,
-                    size: 40,
-                  ),
-            title: Text(
-              folderName,
-              style: GoogleFonts.cairo(
-                fontWeight: FontWeight.bold,
-                color: Colors.white,
+          final isSelected = _selectedPaths.contains(item.path);
+          final isDark = Theme.of(context).brightness == Brightness.dark;
+          final primaryColor = Theme.of(context).primaryColor;
+
+          return Container(
+            margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: ListTile(
+              tileColor: isSelected
+                  ? primaryColor.withValues(alpha: 0.12)
+                  : isDark
+                  ? const Color(0xFF141824)
+                  : Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+                side: BorderSide(
+                  color: isSelected
+                      ? primaryColor
+                      : isDark
+                      ? const Color(0xFF1F2636)
+                      : const Color(0xFFE8ECEF),
+                  width: isSelected ? 1.5 : 1.0,
+                ),
               ),
-            ),
-            onLongPress: () => _toggleSelection(item.path),
-            onTap: () {
-              if (_isSelectionMode) {
-                _toggleSelection(item.path);
-                return;
-              }
-              setState(() => _currentFolder = item);
-              _loadHiddenFiles();
-            },
-          );
-        }
-
-        if (item is File && item.path.endsWith('.vault_hidden')) {
-          String fileName = item.uri.pathSegments.last.replaceAll(
-            '.vault_hidden',
-            '',
-          );
-
-          IconData icon = Icons.lock;
-          Color iconColor = Colors.redAccent;
-          if (_isVideo(fileName)) {
-            icon = Icons.video_library;
-            iconColor = Colors.blueAccent;
-          } else if (_isAudio(fileName)) {
-            icon = Icons.music_note;
-            iconColor = Colors.purpleAccent;
-          } else if (_isImage(fileName)) {
-            icon = Icons.image;
-            iconColor = Colors.greenAccent;
-          }
-
-          return ListTile(
-            leading: _isSelectionMode
-                ? Checkbox(
-                    value: _selectedPaths.contains(item.path),
-                    onChanged: (_) => _toggleSelection(item.path),
-                    activeColor: Theme.of(context).primaryColor,
-                  )
-                : Icon(icon, color: iconColor),
-            title: Text(fileName, style: GoogleFonts.cairo()),
-            trailing: _isSelectionMode
-                ? null
-                : IconButton(
-                    icon: const Icon(Icons.restore, color: Colors.greenAccent),
-                    tooltip: 'استرجاع',
-                    onPressed: () => _restoreFile(item),
-                  ),
-            onLongPress: () => _toggleSelection(item.path),
-            onTap: () {
-              if (_isSelectionMode) {
-                _toggleSelection(item.path);
-                return;
-              }
-              if (_isImage(fileName)) {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => ImageViewerScreen(imageFile: item),
-                  ),
-                );
-              } else {
-                List<File> playlistFiles = _folderViewItems
-                    .whereType<File>()
-                    .where((f) => f.path.endsWith('.vault_hidden'))
-                    .toList();
-                int initialIndex = playlistFiles.indexOf(item);
-                if (initialIndex == -1) initialIndex = 0;
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => PlayerScreen(
-                      mediaFiles: playlistFiles,
-                      initialIndex: initialIndex,
-                      isVideo: _isVideo(fileName),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 14,
+                vertical: 2,
+              ),
+              leading: _isSelectionMode
+                  ? Checkbox(
+                      value: isSelected,
+                      onChanged: (_) => _toggleSelection(item.path),
+                      activeColor: primaryColor,
+                    )
+                  : const GradientIcon(
+                      Icons.folder_rounded,
+                      size: 40,
                     ),
-                  ),
-                );
-              }
-            },
+              title: Text(
+                folderName,
+                style: GoogleFonts.cairo(
+                  fontSize: 15,
+                  fontWeight: FontWeight.bold,
+                  color: isDark ? Colors.white : Colors.black87,
+                ),
+              ),
+              onTap: () {
+                if (_isSelectionMode) {
+                  _toggleSelection(item.path);
+                  return;
+                }
+                setState(() {
+                  _currentFolder = item;
+                  _loadHiddenFiles();
+                });
+              },
+              onLongPress: () => _toggleSelection(item.path),
+            ),
           );
+        } else if (item is File) {
+          return _buildFileList([item], showFolderSubtitle: true);
         }
         return const SizedBox.shrink();
       },
@@ -732,52 +807,34 @@ class _VaultScreenState extends State<VaultScreen>
   @override
   Widget build(BuildContext context) {
     String lang = AppSettings.languageNotifier.value;
-    if (!_isAuthenticated) {
-      return Scaffold(
-        backgroundColor: Colors.black,
-        body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(Icons.lock, size: 80, color: Theme.of(context).primaryColor),
-              const SizedBox(height: 20),
-              Text(
-                AppLocalizations.get('vault_locked', lang),
-                style: GoogleFonts.cairo(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const SizedBox(height: 20),
-              ElevatedButton(
-                onPressed: _authenticate,
-                child: Text(AppLocalizations.get('reauthenticate', lang)),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
 
     return Scaffold(
       appBar: _isSelectionMode
           ? AppBar(
               backgroundColor: Theme.of(context).primaryColor,
+              foregroundColor: Colors.white,
+              iconTheme: const IconThemeData(color: Colors.white),
               leading: IconButton(
                 icon: const Icon(Icons.close),
                 onPressed: () => setState(() => _selectedPaths.clear()),
               ),
-              title: Text('${_selectedPaths.length} ${AppLocalizations.get('selected_count', lang)}'),
+              title: Text(
+                '${_selectedPaths.length} ${AppLocalizations.get('selected_count', lang)}',
+                style: GoogleFonts.cairo(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
               actions: [
                 IconButton(
                   icon: const Icon(Icons.select_all),
                   onPressed: () {
                     setState(() {
-                      var fileItems = _getCurrentTabFiles();
-                      if (_selectedPaths.length == fileItems.length) {
+                      var paths = _getCurrentTabPaths();
+                      if (_selectedPaths.length == paths.length) {
                         _selectedPaths.clear();
                       } else {
-                        _selectedPaths.addAll(fileItems.map((e) => e.path));
+                        _selectedPaths.addAll(paths);
                       }
                     });
                   },
@@ -825,17 +882,38 @@ class _VaultScreenState extends State<VaultScreen>
                   : null,
               actions: [
                 IconButton(
+                  icon: const Icon(
+                    Icons.security_rounded,
+                    color: Colors.redAccent,
+                  ),
+                  tooltip: lang == 'ar' ? 'سجل المتجسسين' : 'Intruder Logs',
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const IntruderLogsScreen(),
+                      ),
+                    );
+                  },
+                ),
+
+                IconButton(
                   icon: const Icon(Icons.sort, color: Colors.white),
                   tooltip: lang == 'ar' ? 'ترتيب الخزنة' : 'Sort Vault',
                   onPressed: _showVaultSortOptions,
                 ),
                 IconButton(
-                  icon: const Icon(
-                    Icons.add_photo_alternate,
-                    color: Colors.white,
-                  ),
-                  tooltip: AppLocalizations.get('upload_images', lang),
-                  onPressed: _uploadImagesToVault,
+                  icon: const Icon(Icons.add, color: Colors.white),
+                  tooltip: _tabController.index == 4
+                      ? AppLocalizations.get('add_apps', lang)
+                      : AppLocalizations.get('upload_images', lang),
+                  onPressed: () {
+                    if (_tabController.index == 4) {
+                      _appsTabKey.currentState?.openAddAppsModal();
+                    } else {
+                      _uploadImagesToVault();
+                    }
+                  },
                 ),
               ],
               bottom: _currentFolder == null
@@ -846,10 +924,26 @@ class _VaultScreenState extends State<VaultScreen>
                       unselectedLabelColor: Colors.white54,
                       isScrollable: true,
                       tabs: [
-                        Tab(icon: const Icon(Icons.video_library), text: AppLocalizations.get('tab_videos', lang)),
-                        Tab(icon: const Icon(Icons.music_note), text: AppLocalizations.get('tab_audio', lang)),
-                        Tab(icon: const Icon(Icons.image), text: AppLocalizations.get('tab_images', lang)),
-                        Tab(icon: const Icon(Icons.folder), text: AppLocalizations.get('tab_folders', lang)),
+                        Tab(
+                          icon: const Icon(Icons.video_library),
+                          text: AppLocalizations.get('tab_videos', lang),
+                        ),
+                        Tab(
+                          icon: const Icon(Icons.music_note),
+                          text: AppLocalizations.get('tab_audio', lang),
+                        ),
+                        Tab(
+                          icon: const Icon(Icons.image),
+                          text: AppLocalizations.get('tab_images', lang),
+                        ),
+                        Tab(
+                          icon: const Icon(Icons.folder),
+                          text: AppLocalizations.get('tab_folders', lang),
+                        ),
+                        Tab(
+                          icon: const Icon(Icons.apps),
+                          text: AppLocalizations.get('tab_apps', lang),
+                        ),
                       ],
                     )
                   : null,
@@ -859,10 +953,15 @@ class _VaultScreenState extends State<VaultScreen>
           : Column(
               children: [
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16.0,
+                    vertical: 8.0,
+                  ),
                   child: TextField(
                     decoration: InputDecoration(
-                      hintText: lang == 'ar' ? 'البحث في الخزنة السرية...' : 'Search Vault...',
+                      hintText: lang == 'ar'
+                          ? 'البحث في الخزنة السرية...'
+                          : 'Search Vault...',
                       prefixIcon: const Icon(Icons.search),
                       filled: true,
                       fillColor: Colors.white10,
@@ -888,6 +987,7 @@ class _VaultScreenState extends State<VaultScreen>
                             _buildFileList(_audioFiles),
                             _buildFileList(_imageFiles),
                             _buildFolderView(),
+                            VaultAppsTab(key: _appsTabKey),
                           ],
                         ),
                 ),

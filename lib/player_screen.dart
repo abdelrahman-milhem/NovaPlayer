@@ -10,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 // import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 // import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:media_scanner/media_scanner.dart';
+import 'package:simple_pip_mode/pip_widget.dart';
 import 'package:volume_controller/volume_controller.dart';
 import 'package:file_picker/file_picker.dart' as fp;
 import 'package:simple_pip_mode/simple_pip.dart';
@@ -17,6 +18,8 @@ import 'dart:convert';
 import 'package:flutter/services.dart';
 import 'utils/app_settings.dart';
 import 'global_player.dart';
+import 'widgets/audio_visualizer_widget.dart';
+import 'widgets/gif_maker_dialog.dart';
 
 class PlayerScreen extends StatefulWidget {
   final List<dynamic> mediaFiles;
@@ -34,13 +37,16 @@ class PlayerScreen extends StatefulWidget {
   State<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerScreenState extends State<PlayerScreen> {
+class _PlayerScreenState extends State<PlayerScreen>
+    with WidgetsBindingObserver {
   late Player player;
   late VideoController videoController;
 
   // Swipe gestures
   bool _isSwiping = false;
   bool _isLeftSwipe = false;
+  bool _isDismissDragging = false;
+  double _dismissDragY = 0.0;
   double _startDragY = 0.0;
   double _startValue = 0.0;
   double _currentSwipeValue = 0.0;
@@ -79,6 +85,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    if (!AppSettings.showStatusBarNotifier.value) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
+
     player = GlobalPlayer.player;
     videoController = VideoController(player);
 
@@ -87,6 +98,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _resetHideTimer();
 
     _applyOrientation();
+
+    // Remember Speed
+    if (AppSettings.rememberSpeedNotifier.value) {
+      SharedPreferences.getInstance().then((prefs) {
+        double savedSpeed = prefs.getDouble('app_saved_speed') ?? 1.0;
+        if (mounted) setState(() => _playbackSpeed = savedSpeed);
+        player.setRate(savedSpeed);
+      });
+    }
+    // Remember Brightness
+    if (AppSettings.rememberBrightnessNotifier.value) {
+      SharedPreferences.getInstance().then((prefs) {
+        double savedBrightness =
+            prefs.getDouble('app_saved_brightness') ?? -1.0;
+        if (savedBrightness >= 0.0) {
+          ScreenBrightness().setScreenBrightness(savedBrightness);
+        }
+      });
+    }
 
     _completedSub = player.stream.completed.listen((completed) {
       if (completed) {
@@ -184,6 +214,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   void _resetHideTimer() {
     _hideTimer?.cancel();
+    if (!AppSettings.autoHideControlsNotifier.value) return;
     if (_showControls && !_isLocked) {
       _hideTimer = Timer(const Duration(seconds: 4), () {
         if (mounted) setState(() => _showControls = false);
@@ -320,10 +351,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden) {
+      return;
+    }
+
+    if (state == AppLifecycleState.paused &&
+        AppSettings.autoPipNotifier.value &&
+        !_isAudioOnly) {
+      _enterPiP();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.manual,
+      overlays: SystemUiOverlay.values,
+    );
+    _hideTimer?.cancel();
     _saveCurrentPosition();
     SystemChrome.setPreferredOrientations([]);
-    _hideTimer?.cancel();
     _completedSub?.cancel();
     _positionSub?.cancel();
     _playingSub?.cancel();
@@ -427,7 +477,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     try {
       final Uint8List? uint8list = await player.screenshot();
       if (uint8list != null) {
-        Directory publicDir = Directory('/storage/emulated/0/Pictures/NovaPlayer');
+        Directory publicDir = Directory(
+          '/storage/emulated/0/Pictures/NovaPlayer',
+        );
         if (!await publicDir.exists()) {
           await publicDir.create(recursive: true);
         }
@@ -444,10 +496,125 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  void _showPipSizePickerModal() {
+    final lang = AppSettings.languageNotifier.value;
+    final primaryColor = Theme.of(context).primaryColor;
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF141824),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                lang == 'ar'
+                    ? 'اختر حجم النافذة العائمة (PiP)'
+                    : 'Choose PiP Window Size',
+                style: GoogleFonts.cairo(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 16),
+              ListTile(
+                leading: Icon(
+                  Icons.picture_in_picture_alt_rounded,
+                  color: primaryColor,
+                ),
+                title: Text(
+                  lang == 'ar' ? 'صغير (Small 240p)' : 'Small (240p)',
+                  style: GoogleFonts.cairo(color: Colors.white),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  SimplePip().enterPipMode();
+                },
+              ),
+              ListTile(
+                leading: Icon(
+                  Icons.picture_in_picture_alt_rounded,
+                  color: primaryColor,
+                ),
+                title: Text(
+                  lang == 'ar' ? 'متوسط (Medium 360p)' : 'Medium (360p)',
+                  style: GoogleFonts.cairo(color: Colors.white),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  SimplePip().enterPipMode();
+                },
+              ),
+              ListTile(
+                leading: Icon(
+                  Icons.picture_in_picture_alt_rounded,
+                  color: primaryColor,
+                ),
+                title: Text(
+                  lang == 'ar' ? 'كبير (Large 480p)' : 'Large (480p)',
+                  style: GoogleFonts.cairo(color: Colors.white),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  SimplePip().enterPipMode();
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _openGifMakerModal() {
+    File? videoFile;
+    if (_currentIndex >= 0 && _currentIndex < widget.mediaFiles.length) {
+      final item = widget.mediaFiles[_currentIndex];
+      if (item is File) {
+        videoFile = item;
+      }
+    }
+
+    if (videoFile == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('عذراً، تعذر تحديد ملف الفيديو')),
+      );
+      return;
+    }
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (context) => GifMakerDialog(
+        player: player,
+        videoFile: videoFile!,
+        currentPosition: player.state.position,
+        totalDuration: player.state.duration,
+      ),
+    );
+  }
+
   void _onVerticalDragStart(DragStartDetails details) async {
     if (!widget.isVideo || _isLocked) return;
     final screenWidth = MediaQuery.of(context).size.width;
-    _isLeftSwipe = details.localPosition.dx < screenWidth / 2;
+    final dx = details.localPosition.dx;
+
+    // Middle 40% screen zone: Drag-to-Dismiss like Google Photos
+    if (dx > screenWidth * 0.3 && dx < screenWidth * 0.7) {
+      _isDismissDragging = true;
+      _startDragY = details.localPosition.dy;
+      return;
+    }
+
+    if (!AppSettings.gestureControlNotifier.value) return;
+    _isLeftSwipe = dx < screenWidth / 2;
     _startDragY = details.localPosition.dy;
 
     if (_isLeftSwipe) {
@@ -473,6 +640,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   void _onVerticalDragUpdate(DragUpdateDetails details) async {
+    if (_isDismissDragging) {
+      final deltaY = details.localPosition.dy - _startDragY;
+      if (deltaY > 0) {
+        setState(() {
+          _dismissDragY = deltaY;
+        });
+      }
+      return;
+    }
+
+    if (!AppSettings.gestureControlNotifier.value) return;
     if (!widget.isVideo || !_isSwiping || _isLocked) return;
 
     final screenHeight = MediaQuery.of(context).size.height;
@@ -514,6 +692,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   void _onVerticalDragEnd(DragEndDetails details) {
+    if (_isDismissDragging) {
+      _isDismissDragging = false;
+      if (_dismissDragY > 110) {
+        Navigator.pop(context);
+      } else {
+        setState(() {
+          _dismissDragY = 0.0;
+        });
+      }
+      return;
+    }
     if (!_isSwiping) return;
     setState(() {
       _isSwiping = false;
@@ -675,10 +864,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _enterPiP() async {
-    if (await SimplePip.isPipAvailable) {
-      await SimplePip().enterPipMode();
-    } else {
-      _showSnackbar('صورة داخل صورة غير مدعومة في هذا الجهاز');
+    if (!mounted) return;
+
+    final lifecycleState = WidgetsBinding.instance.lifecycleState;
+    if (lifecycleState != AppLifecycleState.resumed) {
+      debugPrint('Skipping PiP request while app lifecycle is $lifecycleState');
+      return;
+    }
+
+    try {
+      if (await SimplePip.isPipAvailable) {
+        await SimplePip().enterPipMode();
+      } else {
+        if (mounted) {
+          _showSnackbar('صورة داخل صورة غير مدعومة في هذا الجهاز');
+        }
+      }
+    } on PlatformException catch (e) {
+      debugPrint('PiP request failed: $e');
+      if (mounted) {
+        _showSnackbar('لا يمكن الدخول إلى وضع الصورة داخل الصورة الآن');
+      }
+    } catch (e) {
+      debugPrint('Unexpected PiP failure: $e');
     }
   }
 
@@ -836,6 +1044,43 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 )
               : Icon(icon, color: Colors.white, size: size * 0.55),
         ),
+      ),
+    );
+  }
+
+  Widget _buildPlayerActionButton({
+    required IconData icon,
+    required VoidCallback onTap,
+    double size = 46,
+    bool accent = false,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: size,
+        height: size,
+        decoration: BoxDecoration(
+          color: accent
+              ? Theme.of(context).primaryColor
+              : Colors.white.withAlpha(18),
+          borderRadius: BorderRadius.circular(size / 2),
+          border: Border.all(
+            color: accent
+                ? Theme.of(context).primaryColor.withAlpha(120)
+                : Colors.white.withAlpha(30),
+            width: 1,
+          ),
+          boxShadow: accent
+              ? [
+                  BoxShadow(
+                    color: Theme.of(context).primaryColor.withAlpha(55),
+                    blurRadius: 18,
+                    offset: const Offset(0, 6),
+                  ),
+                ]
+              : null,
+        ),
+        child: Icon(icon, color: Colors.white, size: size * 0.5),
       ),
     );
   }
@@ -1285,6 +1530,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       if (next > 2.0) next = 0.5;
                       setState(() => _playbackSpeed = next);
                       player.setRate(next);
+                      if (AppSettings.rememberSpeedNotifier.value) {
+                        SharedPreferences.getInstance().then((prefs) {
+                          prefs.setDouble('app_saved_speed', next);
+                        });
+                      }
                       _resetHideTimer();
                     },
                   ),
@@ -1317,6 +1567,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   ),
                   const SizedBox(width: 15),
                   _buildPillButton(
+                    icon: Icons.picture_in_picture_alt_rounded,
+                    onTap: () {
+                      _showPipSizePickerModal();
+                      _resetHideTimer();
+                    },
+                  ),
+                  const SizedBox(width: 15),
+                  _buildPillButton(
                     icon: Icons.lock_open,
                     onTap: () {
                       setState(() {
@@ -1329,17 +1587,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ),
             ),
 
-          // Screenshot Button (Left Edge)
+          // Screenshot & GIF Buttons (Left Edge)
           if (!_isLocked && widget.isVideo)
             Positioned(
               left: 20,
-              top: MediaQuery.of(context).size.height / 2 - 25,
-              child: _buildPillButton(
-                icon: Icons.camera_alt,
-                onTap: () {
-                  _takeScreenshot();
-                  _resetHideTimer();
-                },
+              top: MediaQuery.of(context).size.height / 2 - 45,
+              child: Column(
+                children: [
+                  _buildPillButton(
+                    icon: Icons.camera_alt,
+                    onTap: () {
+                      _takeScreenshot();
+                      _resetHideTimer();
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  _buildPillButton(
+                    icon: Icons.gif_box_rounded,
+                    onTap: () {
+                      _openGifMakerModal();
+                      _resetHideTimer();
+                    },
+                  ),
+                ],
               ),
             ),
 
@@ -1393,76 +1663,101 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       builder: (context, snapshot) {
                         final position = snapshot.data ?? Duration.zero;
                         final duration = player.state.duration;
+                        final maxValue = duration.inMilliseconds.toDouble() > 0
+                            ? duration.inMilliseconds.toDouble()
+                            : 1.0;
 
-                        return Row(
+                        return Column(
                           children: [
-                            Text(
-                              _formatDuration(position),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 14,
-                              ),
-                            ),
-                            Expanded(
-                              child: SliderTheme(
-                                data: SliderTheme.of(context).copyWith(
-                                  trackHeight: 4.0,
-                                  thumbShape: const RoundSliderThumbShape(
-                                    enabledThumbRadius: 8.0,
+                            Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 6,
                                   ),
-                                  overlayShape: const RoundSliderOverlayShape(
-                                    overlayRadius: 16.0,
+                                  decoration: BoxDecoration(
+                                    color: Colors.white.withAlpha(18),
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  child: Text(
+                                    _formatDuration(position),
+                                    style: GoogleFonts.cairo(
+                                      color: Colors.white,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                    ),
                                   ),
                                 ),
-                                child: Slider(
-                                  value: position.inMilliseconds
-                                      .toDouble()
-                                      .clamp(
-                                        0.0,
-                                        duration.inMilliseconds.toDouble() > 0
-                                            ? duration.inMilliseconds.toDouble()
-                                            : 1.0,
+                                Expanded(
+                                  child: SliderTheme(
+                                    data: SliderTheme.of(context).copyWith(
+                                      trackHeight: 4.0,
+                                      activeTrackColor: Theme.of(
+                                        context,
+                                      ).primaryColor,
+                                      inactiveTrackColor: Colors.white30,
+                                      thumbColor: Colors.white,
+                                      thumbShape: const RoundSliderThumbShape(
+                                        enabledThumbRadius: 7.5,
                                       ),
-                                  min: 0.0,
-                                  max: duration.inMilliseconds.toDouble() > 0
-                                      ? duration.inMilliseconds.toDouble()
-                                      : 1.0,
-                                  activeColor: Colors.greenAccent,
-                                  inactiveColor: Colors.white30,
-                                  onChanged: (val) {
-                                    player.seek(
-                                      Duration(milliseconds: val.toInt()),
-                                    );
-                                    _resetHideTimer();
-                                  },
+                                      overlayShape:
+                                          const RoundSliderOverlayShape(
+                                            overlayRadius: 16.0,
+                                          ),
+                                      overlayColor: Theme.of(
+                                        context,
+                                      ).primaryColor.withAlpha(50),
+                                    ),
+                                    child: Slider(
+                                      value: position.inMilliseconds
+                                          .toDouble()
+                                          .clamp(0.0, maxValue),
+                                      min: 0.0,
+                                      max: maxValue,
+                                      onChanged: (val) {
+                                        player.seek(
+                                          Duration(milliseconds: val.toInt()),
+                                        );
+                                        _resetHideTimer();
+                                      },
+                                    ),
+                                  ),
                                 ),
-                              ),
-                            ),
-                            Text(
-                              _formatDuration(duration),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 14,
-                              ),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 6,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white.withAlpha(18),
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  child: Text(
+                                    _formatDuration(duration),
+                                    style: GoogleFonts.cairo(
+                                      color: Colors.white,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
                           ],
                         );
                       },
                     ),
 
-                    const SizedBox(height: 10),
+                    const SizedBox(height: 12),
 
                     // Bottom Buttons
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                       children: [
-                        IconButton(
-                          icon: const Icon(
-                            Icons.aspect_ratio,
-                            color: Colors.white,
-                            size: 28,
-                          ),
-                          onPressed: () {
+                        _buildPlayerActionButton(
+                          icon: Icons.aspect_ratio,
+                          onTap: () {
                             setState(() {
                               if (_fit == BoxFit.contain) {
                                 _fit = BoxFit.cover;
@@ -1478,13 +1773,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                             _resetHideTimer();
                           },
                         ),
-                        IconButton(
-                          icon: const Icon(
-                            Icons.skip_previous,
-                            color: Colors.white,
-                            size: 42,
-                          ),
-                          onPressed: () {
+                        _buildPlayerActionButton(
+                          icon: Icons.skip_previous_rounded,
+                          size: 54,
+                          onTap: () {
                             _playPrevManually(autoPlay: true);
                             _resetHideTimer();
                           },
@@ -1492,40 +1784,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         StreamBuilder<bool>(
                           stream: player.stream.playing,
                           builder: (context, snapshot) {
-                            final playing = snapshot.data ?? false;
-                            return IconButton(
-                              icon: Icon(
-                                playing
-                                    ? Icons.pause_circle_filled
-                                    : Icons.play_circle_filled,
-                                color: Colors.white,
-                                size: 64,
-                              ),
-                              onPressed: () {
-                                player.playOrPause();
+                            final playing =
+                                snapshot.data ?? player.state.playing;
+                            return _buildPlayerActionButton(
+                              icon: playing
+                                  ? Icons.pause_circle_filled_rounded
+                                  : Icons.play_circle_fill_rounded,
+                              size: 72,
+                              accent: true,
+                              onTap: () {
+                                if (playing) {
+                                  player.pause();
+                                } else {
+                                  player.play();
+                                }
                                 _resetHideTimer();
                               },
                             );
                           },
                         ),
-                        IconButton(
-                          icon: const Icon(
-                            Icons.skip_next,
-                            color: Colors.white,
-                            size: 42,
-                          ),
-                          onPressed: () {
+                        _buildPlayerActionButton(
+                          icon: Icons.skip_next_rounded,
+                          size: 54,
+                          onTap: () {
                             _playNextManually(autoPlay: true);
                             _resetHideTimer();
                           },
                         ),
-                        IconButton(
-                          icon: const Icon(
-                            Icons.lock_outline,
-                            color: Colors.white,
-                            size: 28,
-                          ),
-                          onPressed: () {
+                        _buildPlayerActionButton(
+                          icon: Icons.lock_outline_rounded,
+                          onTap: () {
                             setState(() {
                               _isLocked = true;
                               _showControls = false;
@@ -1545,145 +1833,276 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    final bool forcePipLayout = MediaQuery.of(context).size.width < 350;
+
+    final pipView = Scaffold(
       backgroundColor: Colors.black,
-      body: SafeArea(
-        child: GestureDetector(
-          behavior: HitTestBehavior.translucent,
-          onTap: _toggleControls,
-          onLongPressStart: (details) {
-            if (_isLocked || !AppSettings.longPressSpeedUpNotifier.value) {
-              return;
-            }
-            if (AppSettings.vibrateOnLongPressNotifier.value) {
-              HapticFeedback.vibrate();
-            }
-            player.setRate(AppSettings.longPressSpeedNotifier.value);
-            _showSnackbar('${AppSettings.longPressSpeedNotifier.value}x تسريع');
-          },
-          onLongPressEnd: (details) {
-            if (_isLocked || !AppSettings.longPressSpeedUpNotifier.value) {
-              return;
-            }
-            player.setRate(_playbackSpeed); // Revert to normal speed
-            _showSnackbar('سرعة عادية');
-          },
-          onDoubleTapDown: (details) {
-            if (_isLocked || !AppSettings.doubleTapToSeekNotifier.value) return;
-            final width = MediaQuery.of(context).size.width;
-            final interval = AppSettings.fastForwardIntervalNotifier.value;
-            if (details.globalPosition.dx > width / 2) {
-              player.seek(player.state.position + Duration(seconds: interval));
-              _showSnackbar('+$interval ثواني');
-            } else {
-              player.seek(player.state.position - Duration(seconds: interval));
-              _showSnackbar('-$interval ثواني');
-            }
-          },
-          onVerticalDragStart: _onVerticalDragStart,
-          onVerticalDragUpdate: _onVerticalDragUpdate,
-          onVerticalDragEnd: _onVerticalDragEnd,
-          child: Stack(
-            children: [
-              Center(
-                child: _isAudioOnly
-                    ? Container(
-                        width: double.infinity,
-                        height: double.infinity,
-                        color: Colors.black,
-                        child: const Center(
-                          child: Icon(
-                            Icons.music_note,
-                            color: Colors.white24,
-                            size: 100,
-                          ),
-                        ),
-                      )
-                    : Transform(
-                        alignment: Alignment.center,
-                        transform: Matrix4.rotationY(
-                          _isMirrored ? 3.1415926535897932 : 0,
-                        ),
-                        child: Video(
-                          controller: videoController,
-                          fit: _fit,
-                          controls: NoVideoControls,
-                        ),
-                      ),
+      body: Center(
+        child: _isAudioOnly
+            ? const Icon(Icons.music_note, color: Colors.white24, size: 80)
+            : Transform(
+                alignment: Alignment.center,
+                transform: Matrix4.rotationY(
+                  _isMirrored ? 3.1415926535897932 : 0,
+                ),
+                child: Video(
+                  controller: videoController,
+                  fit: _fit,
+                  controls: NoVideoControls,
+                ),
               ),
+      ),
+    );
 
-              if (_isNightMode)
-                Container(color: Colors.black.withAlpha((255 * 0.5).toInt())),
+    if (forcePipLayout) return pipView;
 
-              _buildCustomControls(),
+    final double bgOpacity = (1.0 - (_dismissDragY / 300.0)).clamp(0.0, 1.0);
+    final double videoScale = (1.0 - (_dismissDragY / 1200.0)).clamp(0.75, 1.0);
 
-              if (_isSwiping && !_isLocked)
-                Center(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 20,
-                      vertical: 15,
-                    ),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withAlpha((255 * 0.6).toInt()),
-                      borderRadius: BorderRadius.circular(15),
-                    ),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
+    return PipWidget(
+      pipBuilder: (context) => pipView,
+      builder: (context) {
+        return Scaffold(
+          backgroundColor: Colors.black.withValues(alpha: bgOpacity),
+          body: Focus(
+            autofocus: true,
+            onKeyEvent: (node, event) {
+              if (event is KeyDownEvent) {
+                final key = event.logicalKey;
+                if (key == LogicalKeyboardKey.space) {
+                  player.playOrPause();
+                  return KeyEventResult.handled;
+                } else if (key == LogicalKeyboardKey.arrowLeft) {
+                  player.seek(
+                    player.state.position - const Duration(seconds: 5),
+                  );
+                  _showSnackbar('-5 ثواني');
+                  return KeyEventResult.handled;
+                } else if (key == LogicalKeyboardKey.arrowRight) {
+                  player.seek(
+                    player.state.position + const Duration(seconds: 5),
+                  );
+                  _showSnackbar('+5 ثواني');
+                  return KeyEventResult.handled;
+                } else if (key == LogicalKeyboardKey.keyF) {
+                  setState(() {
+                    _fit = _fit == BoxFit.contain
+                        ? BoxFit.cover
+                        : BoxFit.contain;
+                  });
+                  return KeyEventResult.handled;
+                } else if (key == LogicalKeyboardKey.escape) {
+                  Navigator.pop(context);
+                  return KeyEventResult.handled;
+                }
+              }
+              return KeyEventResult.ignored;
+            },
+            child: Transform.translate(
+              offset: Offset(0, _dismissDragY),
+              child: Transform.scale(
+                scale: videoScale,
+                child: SafeArea(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.translucent,
+                    onTap: _toggleControls,
+                    onLongPressStart: (details) {
+                      if (_isLocked ||
+                          !AppSettings.longPressSpeedUpNotifier.value) {
+                        return;
+                      }
+                      if (AppSettings.vibrateOnLongPressNotifier.value) {
+                        HapticFeedback.vibrate();
+                      }
+                      player.setRate(AppSettings.longPressSpeedNotifier.value);
+                      _showSnackbar(
+                        '${AppSettings.longPressSpeedNotifier.value}x تسريع',
+                      );
+                    },
+                    onLongPressEnd: (details) {
+                      if (_isLocked ||
+                          !AppSettings.longPressSpeedUpNotifier.value) {
+                        return;
+                      }
+                      player.setRate(_playbackSpeed); // Revert to normal speed
+                      _showSnackbar('سرعة عادية');
+                    },
+                    onDoubleTapDown: (details) {
+                      if (_isLocked ||
+                          !AppSettings.doubleTapToSeekNotifier.value) {
+                        return;
+                      }
+                      final width = MediaQuery.of(context).size.width;
+                      final interval =
+                          AppSettings.fastForwardIntervalNotifier.value;
+                      if (details.globalPosition.dx > width / 2) {
+                        player.seek(
+                          player.state.position + Duration(seconds: interval),
+                        );
+                        _showSnackbar('+$interval ثواني');
+                      } else {
+                        player.seek(
+                          player.state.position - Duration(seconds: interval),
+                        );
+                        _showSnackbar('-$interval ثواني');
+                      }
+                    },
+                    onVerticalDragStart: _onVerticalDragStart,
+                    onVerticalDragUpdate: _onVerticalDragUpdate,
+                    onVerticalDragEnd: _onVerticalDragEnd,
+                    child: Stack(
                       children: [
-                        Icon(_swipeIcon, color: Colors.white, size: 48),
-                        const SizedBox(height: 10),
-                        Text(
-                          '${(_currentSwipeValue * 100).toInt()}%',
-                          style: GoogleFonts.cairo(
-                            color: Colors.white,
-                            fontSize: 24,
-                            fontWeight: FontWeight.bold,
-                          ),
+                        Center(
+                          child: (_isAudioOnly || !widget.isVideo)
+                              ? Container(
+                                  width: double.infinity,
+                                  height: double.infinity,
+                                  color: const Color(0xFF0C0E14),
+                                  child: Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Container(
+                                        width: 130,
+                                        height: 130,
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          color: Theme.of(context).primaryColor
+                                              .withValues(alpha: 0.15),
+                                          border: Border.all(
+                                            color: Theme.of(context)
+                                                .primaryColor
+                                                .withValues(alpha: 0.4),
+                                            width: 2,
+                                          ),
+                                        ),
+                                        child: Icon(
+                                          Icons.music_note_rounded,
+                                          color: Theme.of(context).primaryColor,
+                                          size: 65,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 35),
+                                      Padding(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 24,
+                                        ),
+                                        child: StreamBuilder<bool>(
+                                          stream: player.stream.playing,
+                                          builder: (context, snapshot) {
+                                            final bool isPlaying =
+                                                snapshot.data ??
+                                                player.state.playing;
+                                            return AudioVisualizerWidget(
+                                              isPlaying: isPlaying,
+                                              primaryColor: Theme.of(
+                                                context,
+                                              ).primaryColor,
+                                              height: 120,
+                                            );
+                                          },
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                )
+                              : Transform(
+                                  alignment: Alignment.center,
+                                  transform: Matrix4.rotationY(
+                                    _isMirrored ? 3.1415926535897932 : 0,
+                                  ),
+                                  child: Video(
+                                    controller: videoController,
+                                    fit: _fit,
+                                    controls: NoVideoControls,
+                                  ),
+                                ),
                         ),
-                        const SizedBox(height: 10),
-                        SizedBox(
-                          width: 100,
-                          child: LinearProgressIndicator(
-                            value: _currentSwipeValue,
-                            backgroundColor: Colors.white30,
-                            valueColor: AlwaysStoppedAnimation<Color>(
-                              Theme.of(context).primaryColor,
+
+                        if (_isNightMode)
+                          Container(
+                            color: Colors.black.withAlpha((255 * 0.5).toInt()),
+                          ),
+
+                        _buildCustomControls(),
+
+                        if (_isSwiping && !_isLocked)
+                          Center(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 20,
+                                vertical: 15,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.black.withAlpha(
+                                  (255 * 0.6).toInt(),
+                                ),
+                                borderRadius: BorderRadius.circular(15),
+                              ),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    _swipeIcon,
+                                    color: Colors.white,
+                                    size: 48,
+                                  ),
+                                  const SizedBox(height: 10),
+                                  Text(
+                                    '${(_currentSwipeValue * 100).toInt()}%',
+                                    style: GoogleFonts.cairo(
+                                      color: Colors.white,
+                                      fontSize: 24,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 10),
+                                  SizedBox(
+                                    width: 100,
+                                    child: LinearProgressIndicator(
+                                      value: _currentSwipeValue,
+                                      backgroundColor: Colors.white30,
+                                      valueColor: AlwaysStoppedAnimation<Color>(
+                                        Theme.of(context).primaryColor,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
 
-              if (_isConverting)
-                Container(
-                  color: Colors.black54,
-                  child: Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        CircularProgressIndicator(
-                          color: Theme.of(context).primaryColor,
-                        ),
-                        const SizedBox(height: 16),
-                        Text(
-                          'جارٍ استخراج الصوت...',
-                          style: GoogleFonts.cairo(
-                            color: Colors.white,
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold,
+                        if (_isConverting)
+                          Container(
+                            color: Colors.black54,
+                            child: Center(
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  CircularProgressIndicator(
+                                    color: Theme.of(context).primaryColor,
+                                  ),
+                                  const SizedBox(height: 16),
+                                  Text(
+                                    'جارٍ استخراج الصوت...',
+                                    style: GoogleFonts.cairo(
+                                      color: Colors.white,
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
                           ),
-                        ),
                       ],
                     ),
                   ),
                 ),
-            ],
+              ),
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }

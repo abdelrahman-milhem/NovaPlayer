@@ -3,16 +3,15 @@ import 'package:flutter/services.dart';
 import 'package:photo_manager/photo_manager.dart';
 import 'folder_content_screen.dart';
 import 'dart:io';
-import 'dart:convert';
+import 'dart:async';
 import 'image_viewer_screen.dart';
-import 'package:media_scanner/media_scanner.dart';
 import '../utils/auth_helper.dart';
-import '../utils/vault_helper.dart';
 import '../utils/folder_theme.dart';
 import '../utils/app_localizations.dart';
 import '../utils/app_settings.dart';
 import '../services/vault_service.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../widgets/customization_dialogs.dart';
 
 class ImagesScreen extends StatefulWidget {
   const ImagesScreen({super.key});
@@ -39,7 +38,7 @@ class _ImagesScreenState extends State<ImagesScreen> {
   String _folderSortMode = 'name';
   bool _folderSortAscending = true;
   Map<String, int> _folderCounts = {};
-  Map<String, int> _folderTotalSizes = {};
+  final Map<String, int> _folderTotalSizes = {};
   Map<String, DateTime> _folderLatestDates = {};
 
   @override
@@ -49,16 +48,35 @@ class _ImagesScreenState extends State<ImagesScreen> {
     _loadTheme();
     PhotoManager.addChangeCallback(changeNotify);
     PhotoManager.startChangeNotify();
+    VaultService.instance.mediaUpdateNotifier.addListener(_onVaultMediaChanged);
+    AppSettings.lockImagesNotifier.addListener(_onLockChanged);
   }
 
-  Future<void> _checkLockStatus() async {
+  void _onLockChanged() {
+    _isAuthenticated = false;
+    _checkLockStatus(autoPrompt: false);
+  }
+
+  Timer? _debounceTimer;
+
+  void _onVaultMediaChanged() {
+    _scheduleFetch();
+  }
+
+  Future<void> _checkLockStatus({bool autoPrompt = false}) async {
     bool isLocked = await AuthHelper.isLocked('lock_images');
     if (mounted) {
       setState(() {
         _isLocked = isLocked;
       });
       if (isLocked) {
-        _authenticate();
+        if (autoPrompt) {
+          _authenticate();
+        } else {
+          setState(() {
+            _isCheckingLock = false;
+          });
+        }
       } else {
         setState(() {
           _isAuthenticated = true;
@@ -101,14 +119,27 @@ class _ImagesScreenState extends State<ImagesScreen> {
   }
 
   void changeNotify(MethodCall call) {
-    if (mounted && _isAuthenticated) {
-      _fetchFolders();
-    }
+    _scheduleFetch();
+  }
+
+  void _scheduleFetch() {
+    if (_debounceTimer?.isActive ?? false) _debounceTimer!.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 500), () {
+      PhotoManager.clearFileCache();
+      if (mounted && _isAuthenticated) {
+        _fetchFolders();
+      }
+    });
   }
 
   @override
   void dispose() {
+    VaultService.instance.mediaUpdateNotifier.removeListener(
+      _onVaultMediaChanged,
+    );
+    AppSettings.lockImagesNotifier.removeListener(_onLockChanged);
     PhotoManager.removeChangeCallback(changeNotify);
+    _debounceTimer?.cancel();
     super.dispose();
   }
 
@@ -130,7 +161,10 @@ class _ImagesScreenState extends State<ImagesScreen> {
         int count = await f.assetCountAsync;
         counts[f.id] = count;
         if (count > 0) {
-          List<AssetEntity> assets = await f.getAssetListRange(start: 0, end: 1);
+          List<AssetEntity> assets = await f.getAssetListRange(
+            start: 0,
+            end: 1,
+          );
           if (assets.isNotEmpty) {
             latestDates[f.id] = assets.first.createDateTime;
           } else {
@@ -181,46 +215,7 @@ class _ImagesScreenState extends State<ImagesScreen> {
   }
 
   Future<void> _calculateFolderSizes(List<AssetPathEntity> folders) async {
-    for (var f in folders) {
-      if (!mounted) return;
-      int count = _folderCounts[f.id] ?? await f.assetCountAsync;
-      if (count > 0) {
-        int total = 0;
-        int pageSize = 100;
-        int totalPages = (count / pageSize).ceil();
-        int pageLimit = totalPages > 5 ? 5 : totalPages;
-        
-        for (int page = 0; page < pageLimit; page++) {
-          try {
-            List<AssetEntity> assets = await f.getAssetListPaged(page: page, size: pageSize);
-            for (var a in assets) {
-              try {
-                File? fileObj = await a.file;
-                if (fileObj != null) {
-                  total += fileObj.lengthSync();
-                }
-              } catch (_) {}
-            }
-          } catch (_) {}
-        }
-        
-        if (totalPages > pageLimit && pageLimit > 0) {
-          total = (total * (totalPages / pageLimit)).round();
-        }
-
-        if (mounted) {
-          setState(() {
-            _folderTotalSizes[f.id] = total;
-          });
-        }
-      } else {
-        if (mounted) {
-          setState(() {
-            _folderTotalSizes[f.id] = 0;
-          });
-        }
-      }
-    }
+    // Disabled folder size calculation to improve performance
   }
 
   void _applyFolderSort() {
@@ -235,8 +230,10 @@ class _ImagesScreenState extends State<ImagesScreen> {
         int sizeB = _folderTotalSizes[b.id] ?? 0;
         res = sizeA.compareTo(sizeB);
       } else if (_folderSortMode == 'date') {
-        DateTime dateA = _folderLatestDates[a.id] ?? DateTime.fromMillisecondsSinceEpoch(0);
-        DateTime dateB = _folderLatestDates[b.id] ?? DateTime.fromMillisecondsSinceEpoch(0);
+        DateTime dateA =
+            _folderLatestDates[a.id] ?? DateTime.fromMillisecondsSinceEpoch(0);
+        DateTime dateB =
+            _folderLatestDates[b.id] ?? DateTime.fromMillisecondsSinceEpoch(0);
         res = dateA.compareTo(dateB);
       } else {
         res = a.name.toLowerCase().compareTo(b.name.toLowerCase());
@@ -270,15 +267,43 @@ class _ImagesScreenState extends State<ImagesScreen> {
                     ),
                   ),
                   const SizedBox(height: 10),
-                  SwitchListTile(
-                    title: Text(
-                      AppLocalizations.get('asc_order', lang),
-                      style: GoogleFonts.cairo(fontSize: 14),
+                  ListTile(
+                    leading: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Theme.of(
+                          context,
+                        ).primaryColor.withValues(alpha: 0.15),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        _folderSortAscending
+                            ? Icons.arrow_upward_rounded
+                            : Icons.arrow_downward_rounded,
+                        color: Theme.of(context).primaryColor,
+                        size: 20,
+                      ),
                     ),
-                    value: _folderSortAscending,
-                    activeThumbColor: Theme.of(context).primaryColor,
-                    onChanged: (val) {
-                      setSheetState(() => _folderSortAscending = val);
+                    title: Text(
+                      _folderSortAscending
+                          ? (lang == 'ar' ? 'ترتيب تصاعدي' : 'Ascending Order')
+                          : (lang == 'ar'
+                                ? 'ترتيب تنازلي'
+                                : 'Descending Order'),
+                      style: GoogleFonts.cairo(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                    trailing: Icon(
+                      Icons.swap_vert_rounded,
+                      color: Theme.of(context).primaryColor,
+                    ),
+                    onTap: () {
+                      setSheetState(
+                        () => _folderSortAscending = !_folderSortAscending,
+                      );
                       setState(() {
                         _applyFolderSort();
                       });
@@ -287,9 +312,15 @@ class _ImagesScreenState extends State<ImagesScreen> {
                   const Divider(),
                   ListTile(
                     leading: const Icon(Icons.sort_by_alpha),
-                    title: Text(AppLocalizations.get('by_name', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('by_name', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _folderSortMode == 'name'
-                        ? Icon(Icons.check, color: Theme.of(context).primaryColor)
+                        ? Icon(
+                            Icons.check,
+                            color: Theme.of(context).primaryColor,
+                          )
                         : null,
                     onTap: () {
                       _folderSortMode = 'name';
@@ -299,9 +330,15 @@ class _ImagesScreenState extends State<ImagesScreen> {
                   ),
                   ListTile(
                     leading: const Icon(Icons.access_time),
-                    title: Text(AppLocalizations.get('by_latest_date', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('by_latest_date', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _folderSortMode == 'date'
-                        ? Icon(Icons.check, color: Theme.of(context).primaryColor)
+                        ? Icon(
+                            Icons.check,
+                            color: Theme.of(context).primaryColor,
+                          )
                         : null,
                     onTap: () {
                       _folderSortMode = 'date';
@@ -311,9 +348,15 @@ class _ImagesScreenState extends State<ImagesScreen> {
                   ),
                   ListTile(
                     leading: const Icon(Icons.data_usage),
-                    title: Text(AppLocalizations.get('by_total_size', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('by_total_size', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _folderSortMode == 'size'
-                        ? Icon(Icons.check, color: Theme.of(context).primaryColor)
+                        ? Icon(
+                            Icons.check,
+                            color: Theme.of(context).primaryColor,
+                          )
                         : null,
                     onTap: () {
                       _folderSortMode = 'size';
@@ -323,9 +366,15 @@ class _ImagesScreenState extends State<ImagesScreen> {
                   ),
                   ListTile(
                     leading: const Icon(Icons.numbers),
-                    title: Text(AppLocalizations.get('by_file_count', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('by_file_count', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _folderSortMode == 'count'
-                        ? Icon(Icons.check, color: Theme.of(context).primaryColor)
+                        ? Icon(
+                            Icons.check,
+                            color: Theme.of(context).primaryColor,
+                          )
                         : null,
                     onTap: () {
                       _folderSortMode = 'count';
@@ -405,23 +454,38 @@ class _ImagesScreenState extends State<ImagesScreen> {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(Icons.lock_rounded, size: 80, color: isDark ? Colors.white30 : Colors.black26),
+              Icon(
+                Icons.lock_rounded,
+                size: 80,
+                color: isDark ? Colors.white30 : Colors.black26,
+              ),
               const SizedBox(height: 20),
               Text(
                 AppLocalizations.get('auth_required', lang),
-                style: GoogleFonts.cairo(fontSize: 18, fontWeight: FontWeight.bold),
+                style: GoogleFonts.cairo(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
               const SizedBox(height: 20),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(
                   backgroundColor: primaryColor,
-                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 32,
+                    vertical: 12,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                 ),
                 onPressed: _authenticate,
                 child: Text(
                   AppLocalizations.get('auth_button', lang),
-                  style: GoogleFonts.cairo(color: Colors.white, fontWeight: FontWeight.bold),
+                  style: GoogleFonts.cairo(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
             ],
@@ -435,6 +499,39 @@ class _ImagesScreenState extends State<ImagesScreen> {
     }).toList();
 
     return Scaffold(
+      appBar: _isSelectionMode
+          ? AppBar(
+              backgroundColor: primaryColor,
+              foregroundColor: Colors.white,
+              iconTheme: const IconThemeData(color: Colors.white),
+              leading: IconButton(
+                icon: const Icon(Icons.close),
+                onPressed: () => setState(() => _selectedFolderIds.clear()),
+              ),
+              title: Text(
+                '${_selectedFolderIds.length} ${lang == 'ar' ? 'محدد' : 'selected'}',
+                style: GoogleFonts.cairo(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.select_all),
+                  onPressed: () {
+                    setState(() {
+                      if (_selectedFolderIds.length == _folders.length) {
+                        _selectedFolderIds.clear();
+                      } else {
+                        _selectedFolderIds.addAll(_folders.map((f) => f.id));
+                      }
+                    });
+                  },
+                  tooltip: lang == 'ar' ? 'تحديد الكل' : 'Select All',
+                ),
+              ],
+            )
+          : null,
       floatingActionButton: _isSelectionMode
           ? FloatingActionButton.extended(
               onPressed: _hideSelectedFolders,
@@ -446,184 +543,229 @@ class _ImagesScreenState extends State<ImagesScreen> {
               backgroundColor: primaryColor,
             )
           : null,
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    style: GoogleFonts.cairo(fontSize: 14),
-                    decoration: InputDecoration(
-                      hintText: AppLocalizations.get('search_images', lang),
-                      hintStyle: GoogleFonts.cairo(color: isDark ? Colors.white38 : Colors.black38, fontSize: 13),
-                      prefixIcon: Icon(Icons.search_rounded, color: primaryColor),
-                      filled: true,
-                      fillColor: isDark ? const Color(0xFF141824) : const Color(0xFFEFF2F7),
-                      contentPadding: const EdgeInsets.symmetric(vertical: 0, horizontal: 16),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(16.0),
-                        borderSide: BorderSide.none,
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(16.0),
-                        borderSide: BorderSide(
-                          color: isDark ? const Color(0xFF1F2636) : const Color(0xFFE2E8F0),
-                          width: 1,
+      body: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 16.0,
+                vertical: 8.0,
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      style: GoogleFonts.cairo(fontSize: 14),
+                      decoration: InputDecoration(
+                        hintText: AppLocalizations.get('search_images', lang),
+                        hintStyle: GoogleFonts.cairo(
+                          color: isDark ? Colors.white38 : Colors.black38,
+                          fontSize: 13,
+                        ),
+                        prefixIcon: Icon(
+                          Icons.search_rounded,
+                          color: primaryColor,
+                        ),
+                        filled: true,
+                        fillColor: isDark
+                            ? const Color(0xFF141824)
+                            : const Color(0xFFEFF2F7),
+                        contentPadding: const EdgeInsets.symmetric(
+                          vertical: 0,
+                          horizontal: 16,
+                        ),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(16.0),
+                          borderSide: BorderSide.none,
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(16.0),
+                          borderSide: BorderSide(
+                            color: isDark
+                                ? const Color(0xFF1F2636)
+                                : const Color(0xFFE2E8F0),
+                            width: 1,
+                          ),
                         ),
                       ),
-                    ),
-                    onChanged: (value) {
-                      setState(() {
-                        _searchQuery = value;
-                      });
-                    },
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Container(
-                  decoration: BoxDecoration(
-                    color: isDark ? const Color(0xFF141824) : const Color(0xFFEFF2F7),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(
-                      color: isDark ? const Color(0xFF1F2636) : const Color(0xFFE2E8F0),
-                      width: 1,
+                      onChanged: (value) {
+                        setState(() {
+                          _searchQuery = value;
+                        });
+                      },
                     ),
                   ),
-                  child: IconButton(
-                    icon: Icon(Icons.tune_rounded, color: primaryColor),
-                    onPressed: _showFolderSortOptions,
-                    tooltip: lang == 'ar' ? 'ترتيب المجلدات' : 'Sort Folders',
+                  const SizedBox(width: 8),
+                  Container(
+                    decoration: BoxDecoration(
+                      color: isDark
+                          ? const Color(0xFF141824)
+                          : const Color(0xFFEFF2F7),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: isDark
+                            ? const Color(0xFF1F2636)
+                            : const Color(0xFFE2E8F0),
+                        width: 1,
+                      ),
+                    ),
+                    child: IconButton(
+                      icon: Icon(Icons.tune_rounded, color: primaryColor),
+                      onPressed: _showFolderSortOptions,
+                      tooltip: lang == 'ar' ? 'ترتيب المجلدات' : 'Sort Folders',
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-          Expanded(
-            child: _isLoading
-                ? Center(child: CircularProgressIndicator(color: primaryColor))
-                : _searchQuery.isNotEmpty
-                ? _buildSearchResults()
-                : filteredFolders.isEmpty
-                ? Center(
-                    child: Text(
-                      AppLocalizations.get('no_folders', lang),
-                      style: GoogleFonts.cairo(color: isDark ? Colors.white38 : Colors.black38),
-                    ),
-                  )
-                : ListView.builder(
-                    padding: const EdgeInsets.symmetric(vertical: 4),
-                    itemCount: filteredFolders.length,
-                    itemBuilder: (context, index) {
-                      final folder = filteredFolders[index];
-                      final int count = _folderCounts[folder.id] ?? 0;
-                      final int? sizeBytes = _folderTotalSizes[folder.id];
-
-                      String subtitleText = '$count ${AppLocalizations.get('image_count', lang)}';
-                      if (sizeBytes != null && sizeBytes > 0) {
-                        subtitleText += ' • ${_formatFileSize(sizeBytes)}';
-                      }
-
-                      final isSelected = _selectedFolderIds.contains(folder.id);
-
-                      return Container(
-                        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: isSelected
-                              ? primaryColor.withValues(alpha: 0.12)
-                              : isDark ? const Color(0xFF141824) : Colors.white,
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border.all(
-                            color: isSelected
-                                ? primaryColor
-                                : isDark ? const Color(0xFF1F2636) : const Color(0xFFE8ECEF),
-                            width: isSelected ? 1.5 : 1.0,
-                          ),
+            Expanded(
+              child: _isLoading
+                  ? Center(
+                      child: CircularProgressIndicator(color: primaryColor),
+                    )
+                  : _searchQuery.isNotEmpty
+                  ? _buildSearchResults()
+                  : filteredFolders.isEmpty
+                  ? Center(
+                      child: Text(
+                        AppLocalizations.get('no_folders', lang),
+                        style: GoogleFonts.cairo(
+                          color: isDark ? Colors.white38 : Colors.black38,
                         ),
-                        child: ListTile(
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                          leading: _isSelectionMode
-                              ? Checkbox(
-                                  value: isSelected,
-                                  onChanged: (_) => _toggleSelection(folder.id),
-                                  activeColor: primaryColor,
-                                )
-                              : Container(
-                                  width: 46,
-                                  height: 46,
-                                  decoration: BoxDecoration(
-                                    color: _folderColor.withValues(alpha: 0.15),
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                  child: Icon(
-                                    _folderIcon,
-                                    size: 26,
-                                    color: _folderColor,
-                                  ),
-                                ),
-                          title: Text(
-                            _getFolderDisplayName(folder, lang),
-                            style: GoogleFonts.cairo(
-                              fontSize: 15,
-                              fontWeight: FontWeight.bold,
-                              color: isDark ? Colors.white : Colors.black87,
-                            ),
+                      ),
+                    )
+                  : ListView.builder(
+                      key: const PageStorageKey('images_folders_list'),
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      itemCount: filteredFolders.length,
+                      itemBuilder: (context, index) {
+                        final folder = filteredFolders[index];
+                        final int count = _folderCounts[folder.id] ?? 0;
+                        final int? sizeBytes = _folderTotalSizes[folder.id];
+
+                        String subtitleText =
+                            '$count ${AppLocalizations.get('image_count', lang)}';
+                        if (sizeBytes != null && sizeBytes > 0) {
+                          subtitleText += ' • ${_formatFileSize(sizeBytes)}';
+                        }
+
+                        final isSelected = _selectedFolderIds.contains(
+                          folder.id,
+                        );
+
+                        return Container(
+                          margin: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 4,
                           ),
-                          subtitle: Text(
-                            subtitleText,
-                            style: GoogleFonts.cairo(
-                              fontSize: 12,
-                              color: isDark ? Colors.white54 : Colors.black54,
-                            ),
-                          ),
-                          trailing: _isSelectionMode
-                              ? null
-                              : PopupMenuButton<String>(
-                                  icon: Icon(
-                                    Icons.more_vert_rounded,
-                                    color: isDark ? Colors.white38 : Colors.black38,
-                                  ),
-                                  onSelected: (value) {
-                                    if (value == 'rename') {
-                                      _renameFolder(folder);
-                                    }
-                                  },
-                                  itemBuilder: (context) => [
-                                    PopupMenuItem(
-                                      value: 'rename',
-                                      child: Text(
-                                        AppLocalizations.get('rename_folder', lang),
-                                        style: GoogleFonts.cairo(fontSize: 13),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                          onLongPress: () => _toggleSelection(folder.id),
-                          onTap: () {
-                            if (_isSelectionMode) {
-                              _toggleSelection(folder.id);
-                              return;
-                            }
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) => FolderContentScreen(
-                                  folder: folder,
-                                  title: _getFolderDisplayName(folder, lang),
-                                  isVideo: false,
-                                  isImage: true,
-                                ),
+                          child: ListTile(
+                            tileColor: isSelected
+                                ? primaryColor.withValues(alpha: 0.12)
+                                : isDark
+                                ? const Color(0xFF141824)
+                                : Colors.white,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(16),
+                              side: BorderSide(
+                                color: isSelected
+                                    ? primaryColor
+                                    : isDark
+                                    ? const Color(0xFF1F2636)
+                                    : const Color(0xFFE8ECEF),
+                                width: isSelected ? 1.5 : 1.0,
                               ),
-                            ).then((_) => _fetchFolders());
-                          },
-                        ),
-                      );
-                    },
-                  ),
-          ),
-        ],
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 2,
+                            ),
+                            leading: _isSelectionMode
+                                ? Checkbox(
+                                    value: isSelected,
+                                    onChanged: (_) =>
+                                        _toggleSelection(folder.id),
+                                    activeColor: primaryColor,
+                                  )
+                                : Container(
+                                    width: 46,
+                                    height: 46,
+                                    decoration: BoxDecoration(
+                                      color: _folderColor.withValues(
+                                        alpha: 0.15,
+                                      ),
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                    child: GradientIcon(_folderIcon, size: 26),
+                                  ),
+                            title: Text(
+                              _getFolderDisplayName(folder, lang),
+                              style: GoogleFonts.cairo(
+                                fontSize: 15,
+                                fontWeight: FontWeight.bold,
+                                color: isDark ? Colors.white : Colors.black87,
+                              ),
+                            ),
+                            subtitle: Text(
+                              subtitleText,
+                              style: GoogleFonts.cairo(
+                                fontSize: 12,
+                                color: isDark ? Colors.white54 : Colors.black54,
+                              ),
+                            ),
+                            trailing: _isSelectionMode
+                                ? null
+                                : PopupMenuButton<String>(
+                                    icon: Icon(
+                                      Icons.more_vert_rounded,
+                                      color: isDark
+                                          ? Colors.white38
+                                          : Colors.black38,
+                                    ),
+                                    onSelected: (value) {
+                                      if (value == 'rename') {
+                                        _renameFolder(folder);
+                                      }
+                                    },
+                                    itemBuilder: (context) => [
+                                      PopupMenuItem(
+                                        value: 'rename',
+                                        child: Text(
+                                          AppLocalizations.get(
+                                            'rename_folder',
+                                            lang,
+                                          ),
+                                          style: GoogleFonts.cairo(
+                                            fontSize: 13,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                            onLongPress: () => _toggleSelection(folder.id),
+                            onTap: () {
+                              if (_isSelectionMode) {
+                                _toggleSelection(folder.id);
+                                return;
+                              }
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => FolderContentScreen(
+                                    folder: folder,
+                                    title: _getFolderDisplayName(folder, lang),
+                                    isVideo: false,
+                                    isImage: true,
+                                  ),
+                                ),
+                              ).then((_) => _fetchFolders());
+                            },
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -632,7 +774,9 @@ class _ImagesScreenState extends State<ImagesScreen> {
     if (bytes <= 0) return "";
     if (bytes < 1024) return "$bytes B";
     if (bytes < 1024 * 1024) return "${(bytes / 1024).toStringAsFixed(1)} KB";
-    if (bytes < 1024 * 1024 * 1024) return "${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB";
+    if (bytes < 1024 * 1024 * 1024) {
+      return "${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB";
+    }
     return "${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB";
   }
 
@@ -642,44 +786,25 @@ class _ImagesScreenState extends State<ImagesScreen> {
   }
 
   Widget _buildAssetSubtitle(AssetEntity file) {
-    return FutureBuilder<File?>(
-      future: () async {
-        try {
-          return await file.file;
-        } catch (_) {
-          return null;
-        }
-      }(),
-      builder: (context, snapshot) {
-        String sizeStr = '';
-        if (snapshot.hasData && snapshot.data != null) {
-          try {
-            sizeStr = _formatFileSize(snapshot.data!.lengthSync());
-          } catch (_) {}
-        }
+    String dateStr = _formatDate(file.createDateTime);
 
-        String dateStr = _formatDate(file.createDateTime);
+    List<String> parts = [];
+    if (dateStr.isNotEmpty) parts.add(dateStr);
 
-        List<String> parts = [];
-        if (sizeStr.isNotEmpty) parts.add(sizeStr);
-        if (dateStr.isNotEmpty) parts.add(dateStr);
-
-        return Text(
-          parts.join(' • '),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(color: Colors.white54, fontSize: 12),
-        );
-      },
+    return Text(
+      parts.join(' • '),
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: const TextStyle(color: Colors.white54, fontSize: 12),
     );
   }
 
   Widget _buildSearchResults() {
     String lang = AppSettings.languageNotifier.value;
     List<AssetEntity> searchResults = _allImages.where((f) {
-      return (f.title ?? AppLocalizations.get('unnamed', lang)).toLowerCase().contains(
-        _searchQuery.toLowerCase(),
-      );
+      return (f.title ?? AppLocalizations.get('unnamed', lang))
+          .toLowerCase()
+          .contains(_searchQuery.toLowerCase());
     }).toList();
 
     if (searchResults.isEmpty) {
@@ -707,15 +832,21 @@ class _ImagesScreenState extends State<ImagesScreen> {
           ),
           subtitle: _buildAssetSubtitle(file),
           onTap: () async {
-            File? imgFile;
-            try {
-              imgFile = await file.file;
-            } catch (_) {}
-            if (imgFile != null && mounted) {
+            int initialIndex = _allImages.indexOf(file);
+            if (initialIndex == -1) initialIndex = index;
+            List<File> realFiles = [];
+            for (var asset in _allImages) {
+              File? f = await asset.file;
+              if (f != null) realFiles.add(f);
+            }
+            if (realFiles.isNotEmpty && mounted) {
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                  builder: (_) => ImageViewerScreen(imageFile: imgFile!),
+                  builder: (_) => ImageViewerScreen(
+                    imagesList: realFiles,
+                    initialIndex: initialIndex.clamp(0, realFiles.length - 1),
+                  ),
                 ),
               );
             }
@@ -755,7 +886,9 @@ class _ImagesScreenState extends State<ImagesScreen> {
           title: Text(AppLocalizations.get('rename_folder', lang)),
           content: TextField(
             controller: nameController,
-            decoration: InputDecoration(labelText: AppLocalizations.get('new_folder_name', lang)),
+            decoration: InputDecoration(
+              labelText: AppLocalizations.get('new_folder_name', lang),
+            ),
           ),
           actions: [
             TextButton(

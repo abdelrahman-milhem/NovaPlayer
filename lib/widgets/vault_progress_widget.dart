@@ -41,12 +41,15 @@ class VaultProgressWidget extends StatelessWidget {
           margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           decoration: BoxDecoration(
-            color: const Color(0xFF1E1E2C).withOpacity(0.95),
+            color: const Color(0xFF1E1E2C).withValues(alpha: 0.95),
             borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: primaryColor.withOpacity(0.4), width: 1.5),
+            border: Border.all(
+              color: primaryColor.withValues(alpha: 0.4),
+              width: 1.5,
+            ),
             boxShadow: [
               BoxShadow(
-                color: Colors.black.withOpacity(0.4),
+                color: Colors.black.withValues(alpha: 0.4),
                 blurRadius: 10,
                 offset: const Offset(0, 4),
               ),
@@ -84,7 +87,9 @@ class VaultProgressWidget extends StatelessWidget {
                     ),
                     Text(
                       state.isCompleted
-                          ? (isAr ? 'تمت العملية بنجاح! ✅' : 'Completed successfully! ✅')
+                          ? (isAr
+                                ? 'تمت العملية بنجاح! ✅'
+                                : 'Completed successfully! ✅')
                           : '${state.currentFileName} ($percent%) • ⏱️ ${state.getFormattedEta(isAr)}',
                       style: GoogleFonts.cairo(
                         color: Colors.white70,
@@ -103,7 +108,7 @@ class VaultProgressWidget extends StatelessWidget {
                 child: Container(
                   padding: const EdgeInsets.all(6),
                   decoration: BoxDecoration(
-                    color: primaryColor.withOpacity(0.2),
+                    color: primaryColor.withValues(alpha: 0.2),
                     shape: BoxShape.circle,
                   ),
                   child: const Icon(
@@ -137,10 +142,13 @@ class VaultProgressWidget extends StatelessWidget {
           decoration: BoxDecoration(
             color: const Color(0xFF1E1E2C),
             borderRadius: BorderRadius.circular(24),
-            border: Border.all(color: primaryColor.withOpacity(0.5), width: 1.5),
+            border: Border.all(
+              color: primaryColor.withValues(alpha: 0.5),
+              width: 1.5,
+            ),
             boxShadow: [
               BoxShadow(
-                color: Colors.black.withOpacity(0.5),
+                color: Colors.black.withValues(alpha: 0.5),
                 blurRadius: 16,
                 offset: const Offset(0, 8),
               ),
@@ -182,7 +190,11 @@ class VaultProgressWidget extends StatelessWidget {
                   if (!state.isCompleted)
                     TextButton.icon(
                       onPressed: () => VaultService.instance.toggleMinimize(),
-                      icon: const Icon(Icons.visibility_off_outlined, size: 16, color: Colors.white70),
+                      icon: const Icon(
+                        Icons.visibility_off_outlined,
+                        size: 16,
+                        color: Colors.white70,
+                      ),
                       label: Text(
                         isAr ? 'إخفاء بالخلفية' : 'Minimize',
                         style: GoogleFonts.cairo(
@@ -191,7 +203,10 @@ class VaultProgressWidget extends StatelessWidget {
                         ),
                       ),
                       style: TextButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
                         backgroundColor: Colors.white12,
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(12),
@@ -239,9 +254,13 @@ class VaultProgressWidget extends StatelessWidget {
                     ),
                   ),
                   Text(
-                    state.isCompleted ? (isAr ? 'اكتمل ✅' : 'Done ✅') : '$percent%',
+                    state.isCompleted
+                        ? (isAr ? 'اكتمل ✅' : 'Done ✅')
+                        : '$percent%',
                     style: GoogleFonts.cairo(
-                      color: state.isCompleted ? Colors.greenAccent : primaryColor,
+                      color: state.isCompleted
+                          ? Colors.greenAccent
+                          : primaryColor,
                       fontSize: 14,
                       fontWeight: FontWeight.bold,
                     ),

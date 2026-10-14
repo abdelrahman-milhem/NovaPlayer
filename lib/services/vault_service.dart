@@ -82,12 +82,214 @@ class VaultProgressState {
   }
 }
 
+class TrashItem {
+  final String id;
+  final String originalPath;
+  final String trashPath;
+  final String fileName;
+  final String category;
+  final DateTime deletedAt;
+
+  TrashItem({
+    required this.id,
+    required this.originalPath,
+    required this.trashPath,
+    required this.fileName,
+    required this.category,
+    required this.deletedAt,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'originalPath': originalPath,
+        'trashPath': trashPath,
+        'fileName': fileName,
+        'category': category,
+        'deletedAt': deletedAt.toIso8601String(),
+      };
+
+  factory TrashItem.fromJson(Map<String, dynamic> json) => TrashItem(
+        id: json['id'] ?? '',
+        originalPath: json['originalPath'] ?? '',
+        trashPath: json['trashPath'] ?? '',
+        fileName: json['fileName'] ?? '',
+        category: json['category'] ?? '',
+        deletedAt: DateTime.parse(json['deletedAt']),
+      );
+}
+
 class VaultService {
   VaultService._privateConstructor();
   static final VaultService instance = VaultService._privateConstructor();
 
+  static bool isDecoyMode = false;
+
   final ValueNotifier<VaultProgressState?> progressNotifier =
       ValueNotifier<VaultProgressState?>(null);
+
+  final ValueNotifier<int> mediaUpdateNotifier = ValueNotifier<int>(0);
+
+  Future<List<File>> getVaultFiles(String category) async {
+    if (isDecoyMode) return [];
+
+    try {
+      final vaultDir = await VaultHelper.getVaultDirectory();
+      final catDir = Directory('${vaultDir.path}/$category');
+      if (!await catDir.exists()) return [];
+
+      final List<FileSystemEntity> entities = await catDir.list().toList();
+      return entities.whereType<File>().toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<File> _getTrashMetadataFile() async {
+    final vaultDir = await VaultHelper.getVaultDirectory();
+    return File('${vaultDir.path}/trash/trash_metadata.json');
+  }
+
+  Future<List<TrashItem>> getTrashItems() async {
+    if (isDecoyMode) return [];
+    try {
+      final file = await _getTrashMetadataFile();
+      if (!await file.exists()) return [];
+
+      final content = await file.readAsString();
+      final List<dynamic> jsonList = jsonDecode(content);
+      final List<TrashItem> items = jsonList.map((e) => TrashItem.fromJson(e)).toList();
+
+      final now = DateTime.now();
+      final List<TrashItem> validItems = [];
+      final List<TrashItem> expiredItems = [];
+
+      for (var item in items) {
+        if (now.difference(item.deletedAt).inDays >= 30) {
+          expiredItems.add(item);
+        } else {
+          validItems.add(item);
+        }
+      }
+
+      for (var item in expiredItems) {
+        final f = File(item.trashPath);
+        if (await f.exists()) await f.delete();
+      }
+
+      if (expiredItems.isNotEmpty) {
+        await file.writeAsString(jsonEncode(validItems.map((e) => e.toJson()).toList()));
+      }
+
+      return validItems;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<bool> moveToTrash(File file, String category) async {
+    try {
+      final vaultDir = await VaultHelper.getVaultDirectory();
+      final trashDir = Directory('${vaultDir.path}/trash/$category');
+      if (!await trashDir.exists()) await trashDir.create(recursive: true);
+
+      final id = DateTime.now().millisecondsSinceEpoch.toString();
+      final fileName = file.path.split('/').last.split('\\').last;
+      final trashPath = '${trashDir.path}/${id}_$fileName';
+
+      await file.rename(trashPath);
+
+      final item = TrashItem(
+        id: id,
+        originalPath: file.path,
+        trashPath: trashPath,
+        fileName: fileName,
+        category: category,
+        deletedAt: DateTime.now(),
+      );
+
+      final current = await getTrashItems();
+      current.add(item);
+
+      final metadataFile = await _getTrashMetadataFile();
+      await metadataFile.writeAsString(jsonEncode(current.map((e) => e.toJson()).toList()));
+
+      mediaUpdateNotifier.value++;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> restoreFromTrash(TrashItem item) async {
+    try {
+      final trashFile = File(item.trashPath);
+      if (await trashFile.exists()) {
+        final targetFile = File(item.originalPath);
+        if (!await targetFile.parent.exists()) {
+          await targetFile.parent.create(recursive: true);
+        }
+        await trashFile.rename(item.originalPath);
+      }
+
+      final items = await getTrashItems();
+      items.removeWhere((i) => i.id == item.id);
+
+      final metadataFile = await _getTrashMetadataFile();
+      await metadataFile.writeAsString(jsonEncode(items.map((e) => e.toJson()).toList()));
+
+      mediaUpdateNotifier.value++;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> deletePermanently(TrashItem item) async {
+    try {
+      final trashFile = File(item.trashPath);
+      if (await trashFile.exists()) {
+        await trashFile.delete();
+      }
+
+      final items = await getTrashItems();
+      items.removeWhere((i) => i.id == item.id);
+
+      final metadataFile = await _getTrashMetadataFile();
+      await metadataFile.writeAsString(jsonEncode(items.map((e) => e.toJson()).toList()));
+
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _notifyMediaScanned(List<String> pathsToScan) async {
+    if (pathsToScan.isEmpty) return;
+
+    // Run MediaScanner sequentially in the background - don't block the UI thread
+    Future(() async {
+      for (final path in pathsToScan) {
+        try {
+          await MediaScanner.loadMedia(path: path);
+        } catch (_) {}
+      }
+    });
+
+    try {
+      await PhotoManager.clearFileCache();
+    } catch (_) {}
+
+    // Single notification after all files are moved
+    mediaUpdateNotifier.value++;
+
+    // Second notification after 2.5s to catch slow MediaStore indexing
+    Future.delayed(const Duration(milliseconds: 2500), () async {
+      try {
+        await PhotoManager.clearFileCache();
+      } catch (_) {}
+      mediaUpdateNotifier.value++;
+    });
+  }
 
   bool get isProcessing =>
       progressNotifier.value != null && !progressNotifier.value!.isCompleted;
@@ -104,10 +306,13 @@ class VaultService {
     progressNotifier.value = null;
   }
 
+  final int _lastProgressNotifyMs = 0;
+
   int? _calcRemainingSeconds(DateTime startTime, double overallProgress) {
     if (overallProgress >= 1.0) return 0;
     if (overallProgress < 0.005) return null;
-    final double elapsedSecs = DateTime.now().difference(startTime).inMilliseconds / 1000.0;
+    final double elapsedSecs =
+        DateTime.now().difference(startTime).inMilliseconds / 1000.0;
     if (elapsedSecs < 0.2) return null;
     final double totalEstSecs = elapsedSecs / overallProgress;
     final int rem = (totalEstSecs - elapsedSecs).round();
@@ -130,36 +335,13 @@ class VaultService {
       await srcFile.rename(targetPath);
       onProgress(1.0);
     } catch (e) {
-      // 2. High-precision chunked stream copy with real-time ETA updates
-      final int totalBytes = await srcFile.length();
-      if (totalBytes == 0) {
-        await srcFile.copy(targetPath);
-        onProgress(1.0);
-      } else {
-        final Stream<List<int>> inputStream = srcFile.openRead();
-        final IOSink outputSink = targetFile.openWrite();
-
-        int bytesTransferred = 0;
-        int lastProgressReportTime = DateTime.now().millisecondsSinceEpoch;
-
-        await for (final chunk in inputStream) {
-          bytesTransferred += chunk.length;
-          outputSink.add(chunk);
-
-          final now = DateTime.now().millisecondsSinceEpoch;
-          if (now - lastProgressReportTime > 50 || bytesTransferred == totalBytes) {
-            lastProgressReportTime = now;
-            onProgress(bytesTransferred / totalBytes);
-            await Future.delayed(Duration.zero);
-          }
-        }
-        await outputSink.flush();
-        await outputSink.close();
-
-        try {
-          await srcFile.delete();
-        } catch (_) {}
-      }
+      // 2. High-precision chunked stream copy caused massive GC pauses on main thread.
+      // We rely on native File.copy() which uses OS-level zero-copy and doesn't pollute Dart heap.
+      await srcFile.copy(targetPath);
+      onProgress(1.0);
+      try {
+        await srcFile.delete();
+      } catch (_) {}
     }
   }
 
@@ -196,27 +378,16 @@ class VaultService {
     final DateTime startTime = DateTime.now();
     final List<String> pathsToScan = [];
 
-    // Pre-fetch files in parallel batches of 10 for 10x faster IPC resolution
-    List<File> resolvedFiles = [];
-    for (int i = 0; i < assets.length; i += 10) {
-      int end = (i + 10 < assets.length) ? i + 10 : assets.length;
-      List<Future<File?>> futures = assets.sublist(i, end).map((a) async {
-        try {
-          return await a.file;
-        } catch (_) {
-          return null;
-        }
-      }).toList();
-      List<File?> results = await Future.wait(futures);
-      for (var f in results) {
-        if (f != null && f.existsSync()) resolvedFiles.add(f);
+    for (int i = 0; i < total; i++) {
+      final AssetEntity a = assets[i];
+      File? file;
+      try {
+        file = await a.file;
+      } catch (_) {}
+
+      if (file == null || !await file.exists()) {
+        continue;
       }
-    }
-
-    final int realTotal = resolvedFiles.length;
-
-    for (int i = 0; i < realTotal; i++) {
-      final File file = resolvedFiles[i];
 
       final String fileName = file.uri.pathSegments.last;
       String folderName = file.parent.path.replaceAll('\\', '/').split('/').last;
@@ -230,7 +401,7 @@ class VaultService {
       final String hiddenName = '$fileName.vault_hidden';
       final String newPath = '${targetFolder.path}/$hiddenName';
 
-      final double currentOverall = i / realTotal;
+      final double currentOverall = i / total;
       progressNotifier.value = progressNotifier.value?.copyWith(
         currentFileName: fileName,
         currentFileIndex: i + 1,
@@ -250,7 +421,7 @@ class VaultService {
         srcFile: file,
         targetPath: newPath,
         onProgress: (fp) {
-          final overall = (i + fp) / realTotal;
+          final overall = (i + fp) / total;
           progressNotifier.value = progressNotifier.value?.copyWith(
             fileProgress: fp,
             overallProgress: overall,
@@ -272,14 +443,8 @@ class VaultService {
       isCompleted: true,
     );
 
-    // Offload MediaScanner calls to background microtask
-    Future.microtask(() async {
-      for (var path in pathsToScan) {
-        try {
-          await MediaScanner.loadMedia(path: path);
-        } catch (_) {}
-      }
-    });
+    // Offload MediaScanner calls and notify PhotoManager & UI
+    _notifyMediaScanned(pathsToScan);
 
     // Auto-dismiss after 1.5 seconds if completed
     Future.delayed(const Duration(milliseconds: 1500), () {
@@ -404,14 +569,8 @@ class VaultService {
       isCompleted: true,
     );
 
-    // Offload MediaScanner calls to background microtask
-    Future.microtask(() async {
-      for (var path in pathsToScan) {
-        try {
-          await MediaScanner.loadMedia(path: path);
-        } catch (_) {}
-      }
-    });
+    // Offload MediaScanner calls and notify PhotoManager & UI
+    _notifyMediaScanned(pathsToScan);
 
     Future.delayed(const Duration(milliseconds: 1500), () {
       if (progressNotifier.value?.isCompleted == true) {
@@ -533,14 +692,8 @@ class VaultService {
       isCompleted: true,
     );
 
-    // Offload MediaScanner calls to background microtask
-    Future.microtask(() async {
-      for (var path in pathsToScan) {
-        try {
-          await MediaScanner.loadMedia(path: path);
-        } catch (_) {}
-      }
-    });
+    // Offload MediaScanner calls and notify PhotoManager & UI
+    _notifyMediaScanned(pathsToScan);
 
     // Auto-dismiss after 1.5 seconds if completed
     Future.delayed(const Duration(milliseconds: 1500), () {

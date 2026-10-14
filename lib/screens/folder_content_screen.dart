@@ -1,5 +1,5 @@
 import 'dart:io';
-import 'dart:convert';
+import 'dart:async';
 import '../utils/app_settings.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -8,10 +8,10 @@ import 'package:media_scanner/media_scanner.dart';
 import '../player_screen.dart';
 import 'image_viewer_screen.dart';
 import 'package:share_plus/share_plus.dart';
-import '../utils/vault_helper.dart';
 import '../services/vault_service.dart';
 import '../utils/app_localizations.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../widgets/customization_dialogs.dart';
 
 class FolderContentScreen extends StatefulWidget {
   final AssetPathEntity folder;
@@ -34,8 +34,8 @@ class FolderContentScreen extends StatefulWidget {
 class _FolderContentScreenState extends State<FolderContentScreen> {
   List<AssetEntity> _mediaFiles = [];
   bool _isLoading = true;
-  int _totalFolderBytes = 0;
-  String _sortMode = 'date'; // 'date', 'name', 'duration', 'size'
+  final int _totalFolderBytes = 0;
+  String _sortMode = 'date';
   String _searchQuery = '';
   bool _sortAscending = false;
   final Map<String, String> _fileSizes = {};
@@ -43,30 +43,53 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
   final Set<String> _selectedIds = {};
   bool get _isSelectionMode => _selectedIds.isNotEmpty;
 
+  Timer? _debounceTimer;
+
   @override
   void initState() {
     super.initState();
     _fetchMedia();
     PhotoManager.addChangeCallback(changeNotify);
     PhotoManager.startChangeNotify();
+    VaultService.instance.mediaUpdateNotifier.addListener(_onVaultMediaChanged);
+  }
+
+  void _onVaultMediaChanged() {
+    _scheduleFetch();
   }
 
   void changeNotify(MethodCall call) {
-    if (mounted) {
-      _fetchMedia();
-    }
+    _scheduleFetch();
+  }
+
+  void _scheduleFetch() {
+    if (_debounceTimer?.isActive ?? false) _debounceTimer!.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 500), () async {
+      try {
+        await PhotoManager.clearFileCache();
+      } catch (_) {}
+      if (mounted) {
+        _fetchMedia();
+      }
+    });
   }
 
   @override
   void dispose() {
+    VaultService.instance.mediaUpdateNotifier.removeListener(
+      _onVaultMediaChanged,
+    );
     PhotoManager.removeChangeCallback(changeNotify);
+    _debounceTimer?.cancel();
     super.dispose();
   }
 
   Future<void> _fetchMedia() async {
-    setState(() {
-      _isLoading = true;
-    });
+    if (_mediaFiles.isEmpty) {
+      setState(() {
+        _isLoading = true;
+      });
+    }
 
     final int count = await widget.folder.assetCountAsync;
     if (count > 0) {
@@ -119,20 +142,7 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
   }
 
   Future<void> _calculateFolderSize(List<AssetEntity> files) async {
-    int sum = 0;
-    for (var f in files) {
-      try {
-        File? fileObj = await f.file;
-        if (fileObj != null) {
-          sum += fileObj.lengthSync();
-        }
-      } catch (_) {}
-    }
-    if (mounted) {
-      setState(() {
-        _totalFolderBytes = sum;
-      });
-    }
+    // Disabled folder size calculation to improve performance
   }
 
   String _formatDuration(int seconds) {
@@ -150,7 +160,9 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
     if (bytes <= 0) return "";
     if (bytes < 1024) return "$bytes B";
     if (bytes < 1024 * 1024) return "${(bytes / 1024).toStringAsFixed(1)} KB";
-    if (bytes < 1024 * 1024 * 1024) return "${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB";
+    if (bytes < 1024 * 1024 * 1024) {
+      return "${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB";
+    }
     return "${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB";
   }
 
@@ -160,37 +172,20 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
   }
 
   Widget _buildAssetSubtitle(AssetEntity file) {
-    return FutureBuilder<File?>(
-      future: () async {
-        try {
-          return await file.file;
-        } catch (_) {
-          return null;
-        }
-      }(),
-      builder: (context, snapshot) {
-        String sizeStr = '';
-        if (snapshot.hasData && snapshot.data != null) {
-          try {
-            sizeStr = _formatFileSize(snapshot.data!.lengthSync());
-          } catch (_) {}
-        }
+    String durationStr = file.duration > 0
+        ? _formatDuration(file.duration)
+        : '';
+    String dateStr = _formatDate(file.createDateTime);
 
-        String durationStr = file.duration > 0 ? _formatDuration(file.duration) : '';
-        String dateStr = _formatDate(file.createDateTime);
+    List<String> parts = [];
+    if (durationStr.isNotEmpty) parts.add(durationStr);
+    if (dateStr.isNotEmpty) parts.add(dateStr);
 
-        List<String> parts = [];
-        if (durationStr.isNotEmpty) parts.add(durationStr);
-        if (sizeStr.isNotEmpty) parts.add(sizeStr);
-        if (dateStr.isNotEmpty) parts.add(dateStr);
-
-        return Text(
-          parts.join(' • '),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(color: Colors.white54, fontSize: 12),
-        );
-      },
+    return Text(
+      parts.join(' • '),
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: const TextStyle(color: Colors.white54, fontSize: 12),
     );
   }
 
@@ -209,32 +204,10 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
       );
     }
 
-    return FutureBuilder<Uint8List?>(
-      future: file.thumbnailDataWithSize(const ThumbnailSize.square(200)),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return Container(
-            color: Colors.grey.withAlpha((255 * 0.2).toInt()),
-            child: const Center(
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-          );
-        }
-        if (snapshot.data == null) {
-          return Container(
-            color: Theme.of(
-              context,
-            ).primaryColor.withAlpha((255 * 0.2).toInt()),
-            child: Icon(
-              widget.isImage
-                  ? Icons.image
-                  : (widget.isVideo ? Icons.videocam : Icons.music_note),
-              color: Theme.of(context).primaryColor,
-            ),
-          );
-        }
-        return Image.memory(snapshot.data!, fit: BoxFit.cover);
-      },
+    return _AssetThumbnailWidget(
+      file: file,
+      isImage: isImage,
+      isVideo: widget.isVideo,
     );
   }
 
@@ -263,22 +236,47 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
                     ),
                   ),
                   const SizedBox(height: 10),
-                  SwitchListTile(
-                    title: Text(
-                      AppLocalizations.get('asc_order', lang),
-                      style: GoogleFonts.cairo(fontSize: 14),
+                  ListTile(
+                    leading: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).primaryColor.withValues(alpha: 0.15),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        _sortAscending
+                            ? Icons.arrow_upward_rounded
+                            : Icons.arrow_downward_rounded,
+                        color: Theme.of(context).primaryColor,
+                        size: 20,
+                      ),
                     ),
-                    value: _sortAscending,
-                    activeThumbColor: Theme.of(context).primaryColor,
-                    onChanged: (val) {
-                      setSheetState(() => _sortAscending = val);
+                    title: Text(
+                      _sortAscending
+                          ? (lang == 'ar' ? 'ترتيب تصاعدي' : 'Ascending Order')
+                          : (lang == 'ar' ? 'ترتيب تنازلي' : 'Descending Order'),
+                      style: GoogleFonts.cairo(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                    trailing: Icon(
+                      Icons.swap_vert_rounded,
+                      color: Theme.of(context).primaryColor,
+                    ),
+                    onTap: () {
+                      setSheetState(() => _sortAscending = !_sortAscending);
                       _applySort(_mediaFiles);
                     },
                   ),
                   const Divider(),
                   ListTile(
                     leading: const Icon(Icons.date_range),
-                    title: Text(AppLocalizations.get('by_date', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('by_date', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _sortMode == 'date'
                         ? Icon(
                             Icons.check,
@@ -293,7 +291,10 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
                   ),
                   ListTile(
                     leading: const Icon(Icons.sort_by_alpha),
-                    title: Text(AppLocalizations.get('by_name', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('by_name', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _sortMode == 'name'
                         ? Icon(
                             Icons.check,
@@ -308,7 +309,10 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
                   ),
                   ListTile(
                     leading: const Icon(Icons.data_usage),
-                    title: Text(AppLocalizations.get('by_size', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('by_size', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _sortMode == 'size'
                         ? Icon(
                             Icons.check,
@@ -323,7 +327,10 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
                   ),
                   ListTile(
                     leading: const Icon(Icons.timer),
-                    title: Text(AppLocalizations.get('duration', lang), style: GoogleFonts.cairo()),
+                    title: Text(
+                      AppLocalizations.get('duration', lang),
+                      style: GoogleFonts.cairo(),
+                    ),
                     trailing: _sortMode == 'duration'
                         ? Icon(
                             Icons.check,
@@ -712,7 +719,9 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
         .toList();
 
     final String lang = AppSettings.languageNotifier.value;
-    final String title = lang == 'ar' ? 'إخفاء الملفات للمجلد السري' : 'Hiding files to Vault';
+    final String title = lang == 'ar'
+        ? 'إخفاء الملفات للمجلد السري'
+        : 'Hiding files to Vault';
 
     final int successCount = await VaultService.instance.hideAssets(
       assets: selectedAssets,
@@ -724,7 +733,6 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
         _mediaFiles.removeWhere((e) => _selectedIds.contains(e.id));
         _selectedIds.clear();
       });
-      _fetchMedia();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('تم إخفاء $successCount ملف في الخزنة السرية')),
       );
@@ -736,7 +744,9 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
     List<AssetEntity> assets,
   ) async {
     final String lang = AppSettings.languageNotifier.value;
-    final String title = lang == 'ar' ? 'إخفاء الملفات للمجلد السري' : 'Hiding files to Vault';
+    final String title = lang == 'ar'
+        ? 'إخفاء الملفات للمجلد السري'
+        : 'Hiding files to Vault';
 
     final int successCount = await VaultService.instance.hideAssets(
       assets: assets,
@@ -764,11 +774,14 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
       } catch (_) {}
       if (file != null && file.existsSync()) {
         try {
-          file.deleteSync();
-          MediaScanner.loadMedia(path: file.path);
-          setState(() {
-            _mediaFiles.removeWhere((e) => e.id == asset.id);
-          });
+          String category = widget.isVideo ? 'Videos' : (widget.isImage ? 'Images' : 'Audio');
+          bool success = await VaultService.instance.moveToTrash(file, category);
+          if (success) {
+            MediaScanner.loadMedia(path: file.path);
+            setState(() {
+              _mediaFiles.removeWhere((e) => e.id == asset.id);
+            });
+          }
         } catch (e) {}
       }
     }
@@ -834,11 +847,19 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
       appBar: _isSelectionMode
           ? AppBar(
               backgroundColor: Theme.of(context).primaryColor,
+              foregroundColor: Colors.white,
+              iconTheme: const IconThemeData(color: Colors.white),
               leading: IconButton(
                 icon: const Icon(Icons.close),
                 onPressed: () => setState(() => _selectedIds.clear()),
               ),
-              title: Text('${_selectedIds.length} محدد'),
+              title: Text(
+                '${_selectedIds.length} محدد',
+                style: GoogleFonts.cairo(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
               actions: [
                 IconButton(
                   icon: const Icon(Icons.select_all),
@@ -877,7 +898,10 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
                 children: [
                   Text(
                     widget.title,
-                    style: GoogleFonts.cairo(fontSize: 18, fontWeight: FontWeight.bold),
+                    style: GoogleFonts.cairo(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                   if (_mediaFiles.isNotEmpty)
                     Text(
@@ -898,16 +922,27 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
       body: Column(
         children: [
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+            padding: const EdgeInsets.symmetric(
+              horizontal: 16.0,
+              vertical: 8.0,
+            ),
             child: TextField(
               style: GoogleFonts.cairo(fontSize: 14),
               decoration: InputDecoration(
                 hintText: 'بحث في الملفات...',
-                hintStyle: GoogleFonts.cairo(color: isDark ? Colors.white38 : Colors.black38, fontSize: 13),
+                hintStyle: GoogleFonts.cairo(
+                  color: isDark ? Colors.white38 : Colors.black38,
+                  fontSize: 13,
+                ),
                 prefixIcon: Icon(Icons.search_rounded, color: primaryColor),
                 filled: true,
-                fillColor: isDark ? const Color(0xFF141824) : const Color(0xFFEFF2F7),
-                contentPadding: const EdgeInsets.symmetric(vertical: 0, horizontal: 16),
+                fillColor: isDark
+                    ? const Color(0xFF141824)
+                    : const Color(0xFFEFF2F7),
+                contentPadding: const EdgeInsets.symmetric(
+                  vertical: 0,
+                  horizontal: 16,
+                ),
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(16.0),
                   borderSide: BorderSide.none,
@@ -915,7 +950,9 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
                 enabledBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(16.0),
                   borderSide: BorderSide(
-                    color: isDark ? const Color(0xFF1F2636) : const Color(0xFFE2E8F0),
+                    color: isDark
+                        ? const Color(0xFF1F2636)
+                        : const Color(0xFFE2E8F0),
                     width: 1,
                   ),
                 ),
@@ -934,10 +971,13 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
                 ? Center(
                     child: Text(
                       'المجلد فارغ أو لا توجد نتائج للبحث',
-                      style: GoogleFonts.cairo(color: isDark ? Colors.white38 : Colors.black38),
+                      style: GoogleFonts.cairo(
+                        color: isDark ? Colors.white38 : Colors.black38,
+                      ),
                     ),
                   )
                 : ListView.builder(
+                    key: PageStorageKey('folder_media_${widget.folder.id}'),
                     padding: const EdgeInsets.symmetric(vertical: 4),
                     itemCount: filteredFiles.length,
                     itemBuilder: (context, index) {
@@ -945,22 +985,34 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
                       final isSelected = _selectedIds.contains(file.id);
 
                       return Container(
-                        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                        margin: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 4,
+                        ),
                         decoration: BoxDecoration(
                           color: isSelected
                               ? primaryColor.withValues(alpha: 0.12)
-                              : isDark ? const Color(0xFF141824) : Colors.white,
+                              : isDark
+                              ? const Color(0xFF141824)
+                              : Colors.white,
                           borderRadius: BorderRadius.circular(16),
                           border: Border.all(
                             color: isSelected
                                 ? primaryColor
-                                : isDark ? const Color(0xFF1F2636) : const Color(0xFFE8ECEF),
+                                : isDark
+                                ? const Color(0xFF1F2636)
+                                : const Color(0xFFE8ECEF),
                             width: isSelected ? 1.5 : 1.0,
                           ),
                         ),
                         child: ListTile(
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 4,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
                           leading: Stack(
                             children: [
                               ClipRRect(
@@ -979,7 +1031,9 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
                                     isSelected
                                         ? Icons.check_circle_rounded
                                         : Icons.radio_button_unchecked_rounded,
-                                    color: isSelected ? primaryColor : Colors.white70,
+                                    color: isSelected
+                                        ? primaryColor
+                                        : Colors.white70,
                                     size: 20,
                                   ),
                                 ),
@@ -1001,7 +1055,9 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
                               : IconButton(
                                   icon: Icon(
                                     Icons.more_vert_rounded,
-                                    color: isDark ? Colors.white38 : Colors.black38,
+                                    color: isDark
+                                        ? Colors.white38
+                                        : Colors.black38,
                                   ),
                                   onPressed: () {
                                     _showFileOptions(file);
@@ -1013,12 +1069,21 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
                               _toggleSelection(file.id);
                             } else {
                               if (widget.isImage) {
-                                File? f = await file.file;
-                                if (f != null && mounted) {
+                                int initialIndex = filteredFiles.indexOf(file);
+                                if (initialIndex == -1) initialIndex = index;
+                                List<File> imageFiles = [];
+                                for (var asset in filteredFiles) {
+                                  File? f = await asset.file;
+                                  if (f != null) imageFiles.add(f);
+                                }
+                                if (mounted && imageFiles.isNotEmpty) {
                                   Navigator.push(
                                     context,
                                     MaterialPageRoute(
-                                      builder: (_) => ImageViewerScreen(imageFile: f),
+                                      builder: (_) => ImageViewerScreen(
+                                        imagesList: imageFiles,
+                                        initialIndex: initialIndex.clamp(0, imageFiles.length - 1),
+                                      ),
                                     ),
                                   );
                                 }
@@ -1052,6 +1117,121 @@ class _FolderContentScreenState extends State<FolderContentScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _ThumbnailCache {
+  static final Map<String, Uint8List> _cache = {};
+  static final List<String> _keys = [];
+
+  static Uint8List? get(String id) => _cache[id];
+
+  static void put(String id, Uint8List data) {
+    if (_cache.containsKey(id)) return;
+    if (_keys.length > 200) {
+      final old = _keys.removeAt(0);
+      _cache.remove(old);
+    }
+    _keys.add(id);
+    _cache[id] = data;
+  }
+}
+
+class _AssetThumbnailWidget extends StatefulWidget {
+  final AssetEntity file;
+  final bool isImage;
+  final bool isVideo;
+
+  const _AssetThumbnailWidget({
+    super.key,
+    required this.file,
+    required this.isImage,
+    required this.isVideo,
+  });
+
+  @override
+  __AssetThumbnailWidgetState createState() => __AssetThumbnailWidgetState();
+}
+
+class __AssetThumbnailWidgetState extends State<_AssetThumbnailWidget> {
+  Uint8List? _data;
+  bool _isLoading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(_AssetThumbnailWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.file.id != widget.file.id) {
+      _load();
+    }
+  }
+
+  Future<void> _load() async {
+    final cached = _ThumbnailCache.get(widget.file.id);
+    if (cached != null) {
+      if (mounted) setState(() => _data = cached);
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+      _isLoading = true;
+      _data = null;
+    });
+    }
+
+    int size = 200;
+    final quality = AppSettings.thumbnailQualityNotifier.value;
+    if (quality == 'low') size = 100;
+    if (quality == 'high') size = 400;
+
+    final data = await widget.file.thumbnailDataWithSize(ThumbnailSize.square(size));
+
+    if (data != null) {
+      _ThumbnailCache.put(widget.file.id, data);
+    }
+
+    if (mounted) {
+      setState(() {
+        _data = data;
+        _isLoading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isLoading) {
+      return Container(
+        color: Colors.grey.withAlpha((255 * 0.2).toInt()),
+        child: const Center(
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      );
+    }
+    if (_data == null) {
+      return Container(
+        color: Theme.of(context).primaryColor.withAlpha((255 * 0.2).toInt()),
+        child: Center(
+          child: GradientIcon(
+            widget.isImage
+                ? Icons.image_rounded
+                : (widget.isVideo ? Icons.videocam_rounded : Icons.music_note_rounded),
+            size: 32,
+          ),
+        ),
+      );
+    }
+    return Image.memory(
+      _data!,
+      fit: BoxFit.cover,
+      gaplessPlayback: true,
     );
   }
 }

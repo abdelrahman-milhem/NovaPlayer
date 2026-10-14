@@ -1,34 +1,41 @@
+import 'dart:io';
 import 'package:media_kit/media_kit.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
 
 class GlobalPlayer {
   static final Player player = Player(configuration: const PlayerConfiguration());
-  static late MediaKitAudioHandler audioHandler;
+  static MediaKitAudioHandler? audioHandler;
 
   static Future<void> init() async {
-    final session = await AudioSession.instance;
-    await session.configure(const AudioSessionConfiguration(
-      avAudioSessionCategory: AVAudioSessionCategory.playback,
-      avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.mixWithOthers,
-      avAudioSessionMode: AVAudioSessionMode.defaultMode,
-      avAudioSessionRouteSharingPolicy: AVAudioSessionRouteSharingPolicy.defaultPolicy,
-      avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
-      androidAudioAttributes: AndroidAudioAttributes(
-        contentType: AndroidAudioContentType.music,
-        flags: AndroidAudioFlags.none,
-        usage: AndroidAudioUsage.media,
-      ),
-    ));
+    if (Platform.isAndroid || Platform.isIOS) {
+      try {
+        final session = await AudioSession.instance;
+        await session.configure(const AudioSessionConfiguration(
+          avAudioSessionCategory: AVAudioSessionCategory.playback,
+          avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.mixWithOthers,
+          avAudioSessionMode: AVAudioSessionMode.defaultMode,
+          avAudioSessionRouteSharingPolicy: AVAudioSessionRouteSharingPolicy.defaultPolicy,
+          avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
+          androidAudioAttributes: AndroidAudioAttributes(
+            contentType: AndroidAudioContentType.music,
+            flags: AndroidAudioFlags.none,
+            usage: AndroidAudioUsage.media,
+          ),
+        ));
 
-    audioHandler = await AudioService.init(
-      builder: () => MediaKitAudioHandler(),
-      config: const AudioServiceConfig(
-        androidNotificationChannelId: 'com.stylora.media_player_app.channel.audio',
-        androidNotificationChannelName: 'Media Playback',
-        androidNotificationOngoing: true,
-      ),
-    );
+        audioHandler = await AudioService.init(
+          builder: () => MediaKitAudioHandler(),
+          config: const AudioServiceConfig(
+            androidNotificationChannelId: 'com.stylora.media_player_app.channel.audio',
+            androidNotificationChannelName: 'Media Playback',
+            androidNotificationOngoing: true,
+          ),
+        );
+      } catch (e) {
+        // Fallback for non-mobile platforms
+      }
+    }
   }
 }
 
@@ -61,10 +68,13 @@ class MediaKitAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandl
     GlobalPlayer.player.stream.playlist.listen((playlist) {
       if (playlist.medias.isNotEmpty && playlist.index >= 0 && playlist.index < playlist.medias.length) {
         final media = playlist.medias[playlist.index];
+        final filename = media.uri.split('/').last;
+        final titleWithoutExt = filename.contains('.') ? filename.substring(0, filename.lastIndexOf('.')) : filename;
         mediaItem.add(MediaItem(
           id: media.uri,
-          album: 'NovaPlayer',
-          title: media.uri.split('/').last,
+          album: 'Zenora Player',
+          title: titleWithoutExt,
+          artUri: Uri.parse('asset:///assets/icon.png'),
         ));
       }
     });
